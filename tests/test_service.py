@@ -119,6 +119,10 @@ class ServiceTests(unittest.TestCase):
         self.config = replace(self.config, service=replace(self.config.service, notify_new_mail=True))
         self.service.config = self.config
 
+    def exclude_ozon_senders(self):
+        self.config = replace(self.config, service=replace(self.config.service, excluded_sender_domains=("ozon.ru", "ozon.com")))
+        self.service.config = self.config
+
     def reopen_service(self):
         self.service.close()
         self.store = Store(self.path)
@@ -286,6 +290,93 @@ class ServiceTests(unittest.TestCase):
         self.assertNotIn(first.subject, self.telegram.sent[0])
         self.assertIsNone(self.store.notification_outbox())
         self.assertEqual(self.store.stats()["pending"], 2)
+
+    def test_excluded_sender_is_skipped_for_notice_and_digest_without_losing_cursor(self):
+        self.enable_notifications()
+        self.exclude_ozon_senders()
+        unwanted = replace(mail(uid=1), sender="Ozon <offers@news.ozon.ru>", subject="Предложение магазина")
+        eligible = replace(mail(uid=2), subject="Письмо для сводки")
+        self.readers[0].result = PollResult(41, 2, [unwanted, eligible])
+        with patch("mail_summary_bot.service.time.time", return_value=1000):
+            self.service.poll_mail()
+            self.service.poll_mail()
+            self.assertTrue(self.service.deliver_notifications(1000))
+            self.service.request_digest()
+            self.assertTrue(self.service.build_digest(1000))
+        self.assertEqual(self.readers[0].calls, [None, (41, 2)])
+        self.assertEqual(self.store.checkpoint("first", account_binding(self.accounts[0])), (41, 2))
+        self.assertEqual(self.store.get("health:first"), "ok")
+        self.assertEqual(len(self.telegram.sent), 1)
+        self.assertIn(eligible.subject, self.telegram.sent[0])
+        self.assertNotIn(unwanted.subject, self.telegram.sent[0])
+        self.assertIsNone(self.store.notification_outbox())
+        self.assertEqual(self.summarizer.calls, [[eligible]])
+        self.assertEqual(self.store.stats()["queued"], 1)
+
+    def test_ozon_display_name_and_content_from_other_domain_remain_eligible(self):
+        self.enable_notifications()
+        self.exclude_ozon_senders()
+        display_name = replace(mail(uid=1), sender='"Ozon" <teacher@unrelated.example>')
+        content = replace(mail(uid=2), subject="Разбор компании Ozon", body="Обсудим ozon.ru на семинаре.")
+        self.readers[0].result = PollResult(41, 2, [display_name, content])
+        self.service.poll_mail()
+        self.service.request_digest()
+        self.assertTrue(self.service.build_digest(1000))
+        self.assertEqual(self.summarizer.calls, [[display_name, content]])
+        self.assertEqual(self.store.notification_stats()["pending"], 2)
+
+    def test_startup_excludes_old_pending_sender_before_building_digest(self):
+        unwanted = replace(mail(uid=1), sender="offers@ozon.com")
+        eligible = replace(mail(uid=2), subject="Сохранённое учебное письмо")
+        self.save_mail(unwanted)
+        self.save_mail(eligible)
+        self.exclude_ozon_senders()
+        self.reopen_service()
+        self.assertEqual([message for _, message in self.store.pending(10, ("first",))], [eligible])
+        self.service.request_digest()
+        self.assertTrue(self.service.build_digest(1000))
+        self.assertEqual(self.summarizer.calls, [[eligible]])
+        self.assertEqual(self.store.checkpoint("first", account_binding(self.accounts[0])), (41, 2))
+
+    def test_startup_cancels_mixed_digest_and_rebuilds_only_eligible_mail(self):
+        self.enable_notifications()
+        unwanted = replace(mail(uid=1), sender="offers@ozon.ru", subject="Исключённый магазин")
+        eligible = replace(mail(uid=2), subject="Нужное учебное письмо")
+        self.readers[0].result = PollResult(41, 2, [unwanted, eligible])
+        self.service.poll_mail()
+        self.summarizer.text = "Старый текст включает исключённый магазин"
+        self.service.request_digest()
+        self.assertTrue(self.service.build_digest(1000))
+        self.assertEqual(self.store.stats()["queued"], 2)
+        self.exclude_ozon_senders()
+        self.reopen_service()
+        self.assertIsNone(self.store.outbox())
+        self.assertEqual([message for _, message in self.store.pending(10, ("first",))], [eligible])
+        self.assertEqual(self.store.notification_stats()["pending"], 1)
+        self.summarizer.text = "Обновлённая сводка учебного письма"
+        self.assertTrue(self.service.build_digest(1001))
+        self.assertEqual(self.summarizer.calls[-1], [eligible])
+        self.assertNotIn("Старый текст", "".join(self.store.outbox()["parts"]))
+        with patch("mail_summary_bot.service.time.time", return_value=1001):
+            self.assertTrue(self.service.deliver_notifications(1001))
+        self.assertIn(eligible.subject, self.telegram.sent[0])
+        self.assertNotIn(unwanted.subject, self.telegram.sent[0])
+
+    def test_sender_exclusion_is_independent_for_two_mailboxes(self):
+        self.enable_notifications()
+        self.exclude_ozon_senders()
+        self.readers[0].result = PollResult(41, 3, [replace(mail(uid=3), sender="no-reply@ozon.ru")])
+        other_mail = mail("second", uid=9)
+        self.readers[1].result = PollResult(41, 9, [other_mail])
+        self.service.poll_mail()
+        self.assertEqual(self.store.checkpoint("first", account_binding(self.accounts[0])), (41, 3))
+        self.assertEqual(self.store.checkpoint("second", account_binding(self.accounts[1])), (41, 9))
+        self.assertEqual(self.store.get("health:first"), "ok")
+        self.assertEqual(self.store.get("health:second"), "ok")
+        self.service.request_digest()
+        self.assertTrue(self.service.build_digest(1000))
+        self.assertEqual(self.summarizer.calls, [[other_mail]])
+        self.assertEqual(self.store.notification_stats()["pending"], 1)
 
     def test_one_mailbox_failure_does_not_block_the_other(self):
         self.readers[0].error = RuntimeError("private-test-password")

@@ -314,6 +314,155 @@ class StoreTests(unittest.TestCase):
         self.assertEqual(self.store.notification_stats(), {"pending": 0, "sent": 0})
         self.assertEqual(self.store.pending(1, ("first",))[0][0], notice_id)
 
+    def test_filtered_new_mail_keeps_cursor_and_identity_without_notice_or_digest(self):
+        blocked = replace(mail(uid=1), sender="alerts@excluded.example")
+        ordinary = mail(uid=2)
+        formatted = []
+
+        def notice(message):
+            formatted.append(message.uid)
+            return ["Уведомление"]
+
+        predicate = lambda message: message.sender.endswith("@excluded.example")
+        self.store.save_poll("first", "binding", PollResult(41, 2, [blocked, ordinary]),
+                             notification_parts=notice, exclude_mail=predicate)
+        self.reopen()
+        self.assertEqual(self.store.checkpoint("first", "binding"), (41, 2))
+        self.assertEqual(self.store.stats(), {"pending": 1, "queued": 0, "sent": 0})
+        self.assertEqual(self.store.excluded_count(), 1)
+        self.assertEqual([message.uid for _, message in self.store.pending(10, ("first",))], [2])
+        self.assertEqual(formatted, [2])
+        self.assertEqual(self.store.notification_stats(), {"pending": 1, "sent": 0})
+        self.assertEqual(self.store.db.execute("SELECT COUNT(*) FROM mail_identities").fetchone()[0], 2)
+
+        replay = replace(blocked, uidvalidity=42, uid=9)
+        self.store.save_poll("first", "binding", PollResult(42, 9, [replay]),
+                             notification_parts=notice, exclude_mail=predicate)
+        self.assertEqual(self.store.checkpoint("first", "binding"), (42, 9))
+        self.assertEqual(self.store.excluded_count(), 1)
+        self.assertEqual(formatted, [2])
+
+    def test_filter_failure_rolls_back_mail_notices_identity_and_cursor(self):
+        self.store.save_poll("first", "binding", PollResult(41, 1, [mail()]))
+
+        def predicate(message):
+            if message.uid == 3:
+                raise RuntimeError("Invalid exclusion rule")
+            return True
+
+        with self.assertRaises(RuntimeError):
+            self.store.save_poll("first", "binding", PollResult(41, 3, [mail(uid=2), mail(uid=3)]),
+                                 notification_parts=lambda message: ["Уведомление"], exclude_mail=predicate)
+        self.reopen()
+        self.assertEqual(self.store.checkpoint("first", "binding"), (41, 1))
+        self.assertEqual(self.store.stats(), {"pending": 1, "queued": 0, "sent": 0})
+        self.assertEqual(self.store.excluded_count(), 0)
+        self.assertIsNone(self.store.notification_outbox())
+        self.assertEqual(self.store.db.execute("SELECT COUNT(*) FROM mail_identities").fetchone()[0], 1)
+
+    def test_backlog_exclusion_is_scoped_to_configured_accounts_and_idempotent(self):
+        self.store.save_poll("first", "first-binding", PollResult(41, 1, [mail()]),
+                             notification_parts=lambda message: ["Первый ящик"])
+        self.store.save_poll("second", "second-binding", PollResult(41, 1, [mail(account="second")]),
+                             notification_parts=lambda message: ["Второй ящик"])
+        self.assertEqual(self.store.exclude_pending(lambda message: True, ()), 0)
+        self.assertEqual(self.store.exclude_pending(lambda message: True, ("first",)), 1)
+        self.assertEqual(self.store.exclude_pending(lambda message: True, ("first",)), 0)
+        self.reopen()
+        self.assertEqual(self.store.excluded_count(), 1)
+        self.assertEqual(self.store.stats(), {"pending": 1, "queued": 0, "sent": 0})
+        self.assertEqual(self.store.notification_outbox()["parts"], ["Второй ящик"])
+        self.assertEqual(self.store.db.execute("SELECT status FROM notifications WHERE message_id=1").fetchone()[0], "excluded")
+
+    def test_excluding_partly_sent_mixed_digest_requeues_remaining_mail(self):
+        self.store.save_poll("first", "binding", PollResult(41, 2, [mail(uid=1), mail(uid=2)]),
+                             notification_parts=lambda message: ["Уведомление"])
+        ids = [mid for mid, _ in self.store.pending(10, ("first",))]
+        digest_id = self.store.queue_digest(ids, ["Уже подтверждённая часть", "Ожидающая часть"])
+        self.store.part_sent(digest_id)
+        self.assertEqual(self.store.exclude_pending(lambda message: message.uid == 1, ("first",)), 1)
+        self.reopen()
+        self.assertIsNone(self.store.outbox())
+        self.assertEqual(self.store.stats(), {"pending": 1, "queued": 0, "sent": 0})
+        self.assertEqual(self.store.excluded_count(), 1)
+        self.assertEqual([message.uid for _, message in self.store.pending(10, ("first",))], [2])
+        cancelled = self.store.db.execute("SELECT status,sent_parts FROM digests WHERE id=?", (digest_id,)).fetchone()
+        self.assertEqual(tuple(cancelled), ("cancelled", 1))
+        self.assertEqual(self.store.notification_outbox()["message_id"], ids[1])
+        clean_id = self.store.queue_digest([ids[1]], ["Чистая сводка"])
+        self.store.part_sent(clean_id)
+        self.assertEqual(self.store.stats(), {"pending": 0, "queued": 0, "sent": 1})
+        self.assertEqual(self.store.excluded_count(), 1)
+
+    def test_backlog_predicate_failure_rolls_back_exclusions_and_notice_cancellation(self):
+        self.store.save_poll("first", "binding", PollResult(41, 2, [mail(uid=1), mail(uid=2)]),
+                             notification_parts=lambda message: ["Уведомление"])
+        ids = [mid for mid, _ in self.store.pending(10, ("first",))]
+        self.store.queue_digest(ids, ["Сводка"])
+
+        def predicate(message):
+            if message.uid == 2:
+                raise RuntimeError("Invalid exclusion rule")
+            return True
+
+        with self.assertRaises(RuntimeError):
+            self.store.exclude_pending(predicate, ("first",))
+        self.reopen()
+        self.assertEqual(self.store.stats(), {"pending": 0, "queued": 2, "sent": 0})
+        self.assertEqual(self.store.excluded_count(), 0)
+        self.assertEqual(self.store.notification_stats(), {"pending": 2, "sent": 0})
+        self.assertEqual(self.store.outbox()["message_ids"], ids)
+
+    def test_filter_cancels_pending_notice_on_sent_mail_without_rewriting_sent_digest(self):
+        self.store.save_poll("first", "binding", PollResult(41, 1, [mail()]),
+                             notification_parts=lambda message: ["Первая часть", "Вторая часть"])
+        notice_id = self.store.notification_outbox()["message_id"]
+        self.store.notification_part_sent(notice_id)
+        digest_id = self.store.queue_digest([notice_id], ["Отправленная сводка"])
+        self.store.part_sent(digest_id)
+        self.assertEqual(self.store.exclude_pending(lambda message: True, ("first",)), 0)
+        self.reopen()
+        self.assertEqual(self.store.stats(), {"pending": 0, "queued": 0, "sent": 1})
+        self.assertEqual(self.store.excluded_count(), 0)
+        self.assertIsNone(self.store.notification_outbox())
+        self.assertEqual(tuple(self.store.db.execute("SELECT status,sent_parts FROM notifications").fetchone()), ("excluded", 1))
+        self.assertEqual(self.store.db.execute("SELECT status FROM digests WHERE id=?", (digest_id,)).fetchone()[0], "sent")
+
+    def test_prune_ages_excluded_mail_notice_and_cancelled_digest_but_retains_pending(self):
+        self.store.save_poll("first", "binding", PollResult(41, 2, [mail(uid=1), mail(uid=2)]),
+                             notification_parts=lambda message: ["Уведомление"])
+        ids = [mid for mid, _ in self.store.pending(10, ("first",))]
+        digest_id = self.store.queue_digest(ids, ["Смешанная сводка"])
+        self.store.exclude_pending(lambda message: message.uid == 1, ("first",))
+        with self.store.db:
+            self.store.db.execute("UPDATE messages SET created_at=0")
+            self.store.db.execute("UPDATE notifications SET created_at=0")
+            self.store.db.execute("UPDATE digests SET created_at=0")
+            self.store.db.execute("UPDATE mail_identities SET created_at=0")
+        self.store.prune(1)
+        self.reopen()
+        self.assertEqual(self.store.excluded_count(), 0)
+        self.assertEqual(self.store.stats(), {"pending": 1, "queued": 0, "sent": 0})
+        self.assertEqual(self.store.notification_outbox()["message_id"], ids[1])
+        self.assertIsNone(self.store.db.execute("SELECT 1 FROM digests WHERE id=?", (digest_id,)).fetchone())
+        self.assertEqual(self.store.db.execute("SELECT COUNT(*) FROM mail_identities").fetchone()[0], 2)
+
+        self.store.notification_part_sent(ids[1])
+        clean_id = self.store.queue_digest([ids[1]], ["Чистая сводка"])
+        self.store.part_sent(clean_id)
+        self.store.prune(1)
+        self.assertEqual(self.store.db.execute("SELECT COUNT(*) FROM mail_identities").fetchone()[0], 0)
+
+    def test_prune_excluded_mail_does_not_pin_old_fingerprints(self):
+        self.store.save_poll("first", "binding", PollResult(41, 1, [mail()]), exclude_mail=lambda message: True)
+        with self.store.db:
+            self.store.db.execute("UPDATE messages SET created_at=0")
+            self.store.db.execute("UPDATE mail_identities SET created_at=0")
+        self.store.prune(1)
+        self.assertEqual(self.store.stats(), {"pending": 0, "queued": 0, "sent": 0})
+        self.assertEqual(self.store.excluded_count(), 0)
+        self.assertEqual(self.store.db.execute("SELECT COUNT(*) FROM mail_identities").fetchone()[0], 0)
+
 
 if __name__ == "__main__":
     unittest.main()

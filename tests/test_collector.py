@@ -122,6 +122,54 @@ class CollectorTests(unittest.TestCase):
         self.assertEqual(reader.calls, [(41, 7)])
         self.assertEqual(self.collector.store.stats()["pending"], 1)
 
+    def test_sender_exclusion_preserves_checkpoint_and_repeated_poll_deduplication(self):
+        config = replace(self.config, service=replace(self.config.service, excluded_sender_domains=("ozon.ru", "ozon.com")))
+        excluded = replace(mail(uid=1), sender="Ozon <offers@news.ozon.ru>")
+        eligible = mail(uid=2)
+        reader = FakeReader(config.service, PollResult(41, 2, [excluded, eligible]))
+        self.replace_collector(config, [reader])
+        self.assertTrue(self.collector.poll())
+        self.assertTrue(self.collector.poll())
+        self.assertEqual(reader.calls, [None, (41, 2)])
+        self.assertEqual(self.collector.store.checkpoint("first", account_binding(self.accounts[0])), (41, 2))
+        self.assertEqual([message for _, message in self.collector.store.pending(10, ("first",))], [eligible])
+        self.assertEqual(self.collector.store.get("health:first"), "ok")
+        self.assertIsNone(self.collector.store.outbox())
+        self.assertIsNone(self.collector.store.notification_outbox())
+
+    def test_sender_exclusion_does_not_use_display_name_subject_or_body(self):
+        config = replace(self.config, service=replace(self.config.service, excluded_sender_domains=("ozon.ru", "ozon.com")))
+        display_name = replace(mail(uid=1), sender='"Ozon" <teacher@unrelated.example>')
+        content = replace(mail(uid=2), subject="Case study Ozon", body="Study ozon.ru for a seminar.")
+        reader = FakeReader(config.service, PollResult(41, 2, [display_name, content]))
+        self.replace_collector(config, [reader])
+        self.assertTrue(self.collector.poll())
+        self.assertEqual([message for _, message in self.collector.store.pending(10, ("first",))], [display_name, content])
+
+    def test_startup_sender_exclusion_cleans_existing_pending_backlog(self):
+        excluded = replace(mail(uid=1), sender="offers@ozon.com")
+        eligible = mail(uid=2)
+        self.collector.store.save_poll("first", account_binding(self.accounts[0]), PollResult(41, 2, [excluded, eligible]))
+        config = replace(self.config, service=replace(self.config.service, excluded_sender_domains=("ozon.ru", "ozon.com")))
+        self.replace_collector(config, [FakeReader(config.service)])
+        self.assertEqual([message for _, message in self.collector.store.pending(10, ("first",))], [eligible])
+        self.assertEqual(self.collector.store.checkpoint("first", account_binding(self.accounts[0])), (41, 2))
+
+    def test_sender_exclusion_does_not_block_second_mailbox(self):
+        config = replace(self.config, accounts=self.accounts, service=replace(self.config.service, excluded_sender_domains=("ozon.ru", "ozon.com")))
+        eligible = mail("second", uid=8)
+        readers = [
+            FakeReader(config.service, PollResult(41, 4, [replace(mail(uid=4), sender="orders@ozon.ru")])),
+            FakeReader(config.service, PollResult(41, 8, [eligible])),
+        ]
+        self.replace_collector(config, readers)
+        self.assertTrue(self.collector.poll())
+        self.assertEqual([message for _, message in self.collector.store.pending(10, ("first", "second"))], [eligible])
+        self.assertEqual(self.collector.store.checkpoint("first", account_binding(self.accounts[0])), (41, 4))
+        self.assertEqual(self.collector.store.checkpoint("second", account_binding(self.accounts[1])), (41, 8))
+        self.assertEqual(self.collector.store.get("health:first"), "ok")
+        self.assertEqual(self.collector.store.get("health:second"), "ok")
+
     def test_two_account_failure_is_isolated_and_no_content_is_logged(self):
         config = replace(self.config, accounts=self.accounts)
         readers = [

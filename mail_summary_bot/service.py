@@ -13,6 +13,7 @@ from .mail import MailReader
 from .store import Store
 from .summarizer import Summarizer
 from .telegram import TelegramClient, split_message
+from .filtering import sender_is_excluded
 
 LOG = logging.getLogger(__name__)
 
@@ -60,6 +61,8 @@ class Service:
         self.next_send_at = 0.0
         for account in config.accounts:
             self.store.checkpoint(account.id, account_binding(account))
+        if config.service.excluded_sender_domains:
+            self.store.exclude_pending(self.excluded, tuple(a.id for a in config.accounts))
         signature = json.dumps([config.service.schedule, config.service.digest_time, config.service.timezone, config.service.digest_interval_minutes])
         if self.store.get("schedule_config") != signature or self.store.get("next_due") is None:
             self.advance_schedule(time.time(), signature=signature)
@@ -68,6 +71,9 @@ class Service:
         self.telegram.close()
         self.summarizer.close()
         self.store.close()
+
+    def excluded(self, message):
+        return sender_is_excluded(message.sender, self.config.service.excluded_sender_domains)
 
     def advance_schedule(self, now: float, *, signature=None):
         settings = self.config.service
@@ -96,6 +102,7 @@ class Service:
                     account.id, binding, result,
                     notification_parts=(lambda mail: split_message(notification_text(mail)))
                     if self.config.service.notify_new_mail else None,
+                    exclude_mail=self.excluded,
                 )
                 if result.epoch_changed:
                     self.store.set(f"epoch_notice:{account.id}", "1")
@@ -176,6 +183,9 @@ class Service:
         lines = ["Почтовая сводка", f"Ожидают сводки: {stats['pending']}", f"Ожидают доставки: {stats['queued']}", f"Режим: {self.config.summary.mode}"]
         lines.append("Уведомления о новых письмах: " + ("включены" if self.config.service.notify_new_mail else "выключены"))
         lines.append(f"Ожидают уведомления: {self.store.notification_stats()['pending']}")
+        if self.config.service.excluded_sender_domains:
+            lines.append("Исключённые отправители: " + ', '.join(self.config.service.excluded_sender_domains))
+            lines.append(f"Исключено писем: {self.store.excluded_count()}")
         zone = ZoneInfo(self.config.service.timezone)
         for account in self.config.accounts:
             stamp = self.store.get(f"last_poll:{account.id}")

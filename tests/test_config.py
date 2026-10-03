@@ -43,6 +43,21 @@ class ConfigTests(unittest.TestCase):
                 with self.assertRaisesRegex(ConfigError, 'notify_new_mail'):
                     load_config(self.config, secrets=False)
 
+    def test_sender_exclusions_are_normalized_and_deduplicated(self):
+        self.assertEqual(load_config(self.config, secrets=False).service.excluded_sender_domains, ())
+        self.config.write_text(BASE.read_text().replace('excluded_sender_domains = []',
+            'excluded_sender_domains = ["OZON.RU", "ozon.ru", "ozon.com"]'))
+        self.assertEqual(load_config(self.config, secrets=False).service.excluded_sender_domains,
+                         ('ozon.ru', 'ozon.com'))
+
+    def test_sender_exclusions_reject_invalid_types_and_domain_patterns(self):
+        for value in ('"ozon.ru"', '[1]', '["orders@ozon.ru"]', '["*.ozon.ru"]', '["https://ozon.ru"]'):
+            with self.subTest(value=value):
+                self.config.write_text(BASE.read_text().replace('excluded_sender_domains = []',
+                    'excluded_sender_domains = ' + value))
+                with self.assertRaisesRegex(ConfigError, 'excluded_sender_domains'):
+                    load_config(self.config, secrets=False)
+
     def test_zero_accounts_are_rejected(self):
         self.config.write_text(BASE.read_text().split('[[accounts]]')[0], encoding="utf-8")
         with self.assertRaisesRegex(ConfigError, "один или два"):

@@ -10,6 +10,7 @@ import time
 from .config import Config
 from .mail import MailReader
 from .store import Store
+from .filtering import sender_is_excluded
 
 
 LOG = logging.getLogger(__name__)
@@ -34,10 +35,15 @@ class Collector:
         try:
             for account in config.accounts:
                 self.store.checkpoint(account.id, account_binding(account))
+            if config.service.excluded_sender_domains:
+                self.store.exclude_pending(self.excluded, tuple(a.id for a in config.accounts))
         except Exception:
             if store is None:
                 self.close()
             raise
+
+    def excluded(self, message):
+        return sender_is_excluded(message.sender, self.config.service.excluded_sender_domains)
 
     def poll(self) -> bool:
         if self._closed:
@@ -59,7 +65,7 @@ class Collector:
                     )
                     adjusted = True
                 result = reader.poll(checkpoint)
-                self.store.save_poll(account.id, binding, result)
+                self.store.save_poll(account.id, binding, result, exclude_mail=self.excluded)
                 updates = {
                     f"health:{account.id}": "ok",
                     f"last_poll:{account.id}": int(time.time()),

@@ -3,6 +3,9 @@ database = "data/state.sqlite3"
 poll_seconds = 60
 # Уведомление о каждом новом письме; не исключает его из сводки.
 notify_new_mail = false
+# Исключить отправителей из уведомлений и сводок, включая поддомены.
+# Например: ["ozon.ru", "ozon.com"]. Письма в почтовом ящике не удаляются.
+excluded_sender_domains = []
 # daily / interval / manual. /summary работает в любом режиме.
 schedule = "daily"
 digest_time = "09:00"

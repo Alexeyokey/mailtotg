@@ -7,6 +7,8 @@ import re
 import shlex
 import tomllib
 
+from .filtering import normalize_domain
+
 
 @dataclass(frozen=True)
 class AccountConfig:
@@ -24,6 +26,7 @@ class ServiceConfig:
     database: str = "data/state.sqlite3"
     poll_seconds: int = 60
     notify_new_mail: bool = False
+    excluded_sender_domains: tuple[str, ...] = ()
     schedule: str = "daily"
     digest_time: str = "09:00"
     timezone: str = "Europe/Moscow"
@@ -137,6 +140,13 @@ def load_config(path: str | Path, *, secrets: bool = True, mail_only: bool = Fal
     summary = _section(SummaryConfig, data.get("summary", {}))
     if type(service.notify_new_mail) is not bool:
         raise ConfigError("notify_new_mail должен быть true или false")
+    if not isinstance(service.excluded_sender_domains, (list, tuple)):
+        raise ConfigError("excluded_sender_domains должен быть списком доменов")
+    try:
+        domains = tuple(dict.fromkeys(normalize_domain(domain) for domain in service.excluded_sender_domains))
+    except ValueError:
+        raise ConfigError("excluded_sender_domains: укажите домены без адресов, ссылок и масок") from None
+    service = replace(service, excluded_sender_domains=domains)
     if service.schedule not in {"daily", "interval", "manual"}:
         raise ConfigError("schedule: daily, interval или manual")
     if service.bootstrap not in {"new", "lookback"}:

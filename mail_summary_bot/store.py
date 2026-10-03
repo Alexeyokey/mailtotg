@@ -91,7 +91,8 @@ class Store:
         return row["uidvalidity"], row["last_uid"]
 
     def save_poll(self, account_id: str, binding: str, result: PollResult, *,
-                  notification_parts: Callable[[MailMessage], list[str]] | None = None):
+                  notification_parts: Callable[[MailMessage], list[str]] | None = None,
+                  exclude_mail: Callable[[MailMessage], bool] | None = None):
         with self.db:
             self.checkpoint(account_id, binding)
             if result.uidvalidity <= 0 or result.last_uid < 0:
@@ -109,6 +110,11 @@ class Store:
                     if not known.rowcount:
                         continue
                 inserted = self.db.execute("INSERT OR IGNORE INTO messages(account_id,uidvalidity,uid,payload,created_at) VALUES (?,?,?,?,?)", (account_id, mail.uidvalidity, mail.uid, json.dumps(asdict(mail), ensure_ascii=False), time.time()))
+                if inserted.rowcount and exclude_mail is not None and exclude_mail(mail):
+                    # Retain the IMAP identity and cursor even for filtered
+                    # mail: it must not be replayed at the next poll/rebuild.
+                    self.db.execute("UPDATE messages SET status='excluded' WHERE id=?", (inserted.lastrowid,))
+                    continue
                 # Only a new insert gets a notice. Enabling notifications never
                 # replays stored backlog, and formatter errors roll back the
                 # mail, identity, outbox, and cursor as one transaction.
@@ -118,6 +124,49 @@ class Store:
                         raise ValueError("Empty or invalid notification")
                     self.db.execute("INSERT INTO notifications(message_id,parts,created_at) VALUES (?,?,?)", (inserted.lastrowid, json.dumps(parts, ensure_ascii=False), time.time()))
             self.db.execute("INSERT INTO checkpoints VALUES (?,?,?,?) ON CONFLICT(account_id) DO UPDATE SET binding=excluded.binding,uidvalidity=excluded.uidvalidity,last_uid=excluded.last_uid", (account_id, binding, result.uidvalidity, result.last_uid))
+
+    def exclude_pending(self, predicate: Callable[[MailMessage], bool],
+                        account_ids: tuple[str, ...]) -> int:
+        """Exclude backlog atomically; return newly excluded source-mail count.
+
+        A pending notice may outlive its already-sent digest. Cancel that notice
+        without rewriting delivery history. A mixed pending digest is immutable,
+        so cancel it and let the remaining queued mail form a clean new digest.
+        Its acknowledged chunks remain recorded and cannot be recalled.
+        """
+        if not account_ids:
+            return 0
+        marks = ",".join("?" for _ in account_ids)
+        excluded = 0
+        with self.db:
+            rows = self.db.execute(f"""
+                SELECT id,payload,status FROM messages
+                WHERE account_id IN ({marks}) AND (
+                    status IN ('pending','queued') OR EXISTS (
+                        SELECT 1 FROM notifications
+                        WHERE notifications.message_id=messages.id
+                            AND notifications.status='pending'
+                    )
+                ) ORDER BY id
+                """, account_ids).fetchall()
+            for row in rows:
+                if not predicate(MailMessage(**json.loads(row["payload"]))):
+                    continue
+                if row["status"] in ("pending", "queued"):
+                    self.db.execute("UPDATE messages SET status='excluded' WHERE id=?", (row["id"],))
+                    excluded += 1
+                self.db.execute("UPDATE notifications SET status='excluded',retry_at=0 WHERE message_id=? AND status='pending'", (row["id"],))
+
+            for digest in self.db.execute("SELECT id,message_ids FROM digests WHERE status='pending'").fetchall():
+                message_ids = json.loads(digest["message_ids"])
+                statuses = [self.db.execute("SELECT status FROM messages WHERE id=?", (mid,)).fetchone()
+                            for mid in message_ids]
+                if not any(row is not None and row["status"] == "excluded" for row in statuses):
+                    continue
+                self.db.execute("UPDATE digests SET status='cancelled',retry_at=0 WHERE id=?", (digest["id"],))
+                for mid in message_ids:
+                    self.db.execute("UPDATE messages SET status='pending' WHERE id=? AND status='queued'", (mid,))
+        return excluded
 
     def pending(self, limit: int, account_ids: tuple[str, ...]):
         marks = ",".join("?" for _ in account_ids)
@@ -206,14 +255,17 @@ class Store:
         counts = {row[0]: row[1] for row in self.db.execute("SELECT status,COUNT(*) FROM messages GROUP BY status")}
         return {status: counts.get(status, 0) for status in ("pending", "queued", "sent")}
 
+    def excluded_count(self) -> int:
+        return self.db.execute("SELECT COUNT(*) FROM messages WHERE status='excluded'").fetchone()[0]
+
     def prune(self, days: int):
         cutoff = time.time() - days * 86400
         with self.db:
-            self.db.execute("DELETE FROM notifications WHERE status='sent' AND created_at<?", (cutoff,))
-            self.db.execute("DELETE FROM messages WHERE status='sent' AND created_at<? AND NOT EXISTS (SELECT 1 FROM notifications WHERE notifications.message_id=messages.id)", (cutoff,))
-            self.db.execute("DELETE FROM digests WHERE status='sent' AND created_at<?", (cutoff,))
+            self.db.execute("DELETE FROM notifications WHERE status IN ('sent','excluded') AND created_at<?", (cutoff,))
+            self.db.execute("DELETE FROM messages WHERE status IN ('sent','excluded') AND created_at<? AND NOT EXISTS (SELECT 1 FROM notifications WHERE notifications.message_id=messages.id)", (cutoff,))
+            self.db.execute("DELETE FROM digests WHERE status IN ('sent','cancelled') AND created_at<?", (cutoff,))
             # Keep identities while any unsent mail remains: recovery must never
             # lose a pending item just because its fingerprint was aged out.
-            if (not self.db.execute("SELECT 1 FROM messages WHERE status!='sent'").fetchone()
+            if (not self.db.execute("SELECT 1 FROM messages WHERE status IN ('pending','queued')").fetchone()
                     and not self.db.execute("SELECT 1 FROM notifications WHERE status='pending'").fetchone()):
                 self.db.execute("DELETE FROM mail_identities WHERE created_at<?", (cutoff,))
