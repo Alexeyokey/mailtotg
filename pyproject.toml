@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "mail-summary-bot"
 version = "0.1.0"
-description = "Read-only IMAP digests from two mailboxes to a private Telegram chat"
+description = "Read-only IMAP digests from one or two mailboxes to a private Telegram chat"
 requires-python = ">=3.11"
 dependencies = ["httpx[socks]>=0.28,<0.29"]
 

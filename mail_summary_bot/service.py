@@ -175,7 +175,7 @@ class Service:
                 elif command == "/status":
                     answer = self.status_text()
                 elif command in {"/start", "/help"}:
-                    answer = "Читаю два настроенных ящика.\n/summary — сводка новых писем\n/status — состояние подключений\nПисьма не помечаются прочитанными."
+                    answer = f"Читаю настроенные ящики: {len(self.config.accounts)}.\n/summary — сводка новых писем\n/status — состояние подключений\nПисьма не помечаются прочитанными."
                 if answer:
                     try:
                         self.telegram.send_text(answer)
@@ -202,7 +202,7 @@ class Service:
         self.store.prune(self.config.service.retention_days)
 
     def run(self):
-        LOG.info("Started: 2 mailboxes, schedule=%s, summary=%s", self.config.service.schedule, self.config.summary.mode)
+        LOG.info("Started: %d mailboxes, schedule=%s, summary=%s", len(self.config.accounts), self.config.service.schedule, self.config.summary.mode)
         while True:
             self.tick()
             time.sleep(1)

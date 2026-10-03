@@ -1,5 +1,5 @@
 [Unit]
-Description=Two-mailbox Telegram summary bot
+Description=IMAP Telegram summary bot
 Wants=network-online.target
 After=network-online.target
 
@@ -8,7 +8,9 @@ Type=simple
 User=mailbot
 Group=mailbot
 WorkingDirectory=/opt/mail-summary-bot
-ExecStart=/opt/mail-summary-bot/.venv/bin/mail-summary-bot run --config /opt/mail-summary-bot/config.toml --env /opt/mail-summary-bot/.env
+EnvironmentFile=/etc/mail-summary-bot/credentials.env
+Environment=PYTHONUNBUFFERED=1 PYTHONDONTWRITEBYTECODE=1
+ExecStart=/opt/mail-summary-bot/.venv/bin/mail-summary-bot run --config /etc/mail-summary-bot/config.toml --env /dev/null
 Restart=on-failure
 RestartSec=10
 UMask=0077
@@ -16,7 +18,9 @@ NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=strict
 ProtectHome=true
-ReadWritePaths=/opt/mail-summary-bot/data
+StateDirectory=mail-summary-bot
+StateDirectoryMode=0700
+ReadWritePaths=/var/lib/mail-summary-bot
 
 [Install]
 WantedBy=multi-user.target

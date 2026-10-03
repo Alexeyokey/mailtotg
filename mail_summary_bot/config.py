@@ -106,7 +106,7 @@ def _section(cls, data):
         raise ConfigError(f"Отсутствуют обязательные настройки {cls.__name__}") from None
 
 
-def load_config(path: str | Path, *, secrets: bool = True) -> Config:
+def load_config(path: str | Path, *, secrets: bool = True, mail_only: bool = False) -> Config:
     file = Path(path).resolve()
     try:
         data = tomllib.loads(file.read_text(encoding="utf-8"))
@@ -115,13 +115,9 @@ def load_config(path: str | Path, *, secrets: bool = True) -> Config:
     if data.keys() - {"accounts", "service", "telegram", "summary"}:
         raise ConfigError("Неизвестный раздел config.toml")
     entries = data.get("accounts", [])
-    if not isinstance(entries, list) or len(entries) != 2:
-        raise ConfigError("Нужно настроить ровно два [[accounts]]")
+    if not isinstance(entries, list) or not 1 <= len(entries) <= 2:
+        raise ConfigError("Нужно настроить один или два [[accounts]]")
     accounts = tuple(_section(AccountConfig, item) for item in entries)
-    if len({a.id for a in accounts}) != 2:
-        raise ConfigError("У двух ящиков должны быть разные id")
-    if len({(a.host, a.username, a.mailbox) for a in accounts}) != 2:
-        raise ConfigError("Два подключения должны указывать на разные ящики")
     for a in accounts:
         if not isinstance(a.id, str) or not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", a.id):
             raise ConfigError("id ящика: 1–64 латинские буквы, цифры, _ или -")
@@ -131,6 +127,10 @@ def load_config(path: str | Path, *, secrets: bool = True) -> Config:
             raise ConfigError(f"Некорректный IMAP port для {a.id}")
         if type(a.timeout_seconds) is not int or a.timeout_seconds <= 0:
             raise ConfigError(f"Некорректный IMAP timeout для {a.id}")
+    if len({a.id for a in accounts}) != len(accounts):
+        raise ConfigError("У ящиков должны быть разные id")
+    if len({(a.host, a.username, a.mailbox) for a in accounts}) != len(accounts):
+        raise ConfigError("Подключения должны указывать на разные ящики")
     service = _section(ServiceConfig, data.get("service", {}))
     telegram = _section(TelegramConfig, data.get("telegram", {}))
     summary = _section(SummaryConfig, data.get("summary", {}))
@@ -161,17 +161,20 @@ def load_config(path: str | Path, *, secrets: bool = True) -> Config:
         database = file.parent / database
     service = replace(service, database=str(database))
     if secrets:
-        required = [a.password_env for a in accounts] + [telegram.token_env, telegram.chat_id_env]
-        if summary.mode != "extractive":
-            required.append(summary.model_env)
-        if summary.mode == "openai":
-            required.append(summary.api_key_env)
+        required = [a.password_env for a in accounts]
+        if not mail_only:
+            required.extend([telegram.token_env, telegram.chat_id_env])
+            if summary.mode != "extractive":
+                required.append(summary.model_env)
+            if summary.mode == "openai":
+                required.append(summary.api_key_env)
         missing = [name for name in required if not os.environ.get(name, "").strip()]
         if missing:
             raise ConfigError("Заполните переменные: " + ", ".join(missing))
-        try:
-            if int(os.environ[telegram.chat_id_env]) <= 0:
-                raise ValueError
-        except ValueError:
-            raise ConfigError("Нужен положительный TELEGRAM_CHAT_ID личного чата") from None
+        if not mail_only:
+            try:
+                if int(os.environ[telegram.chat_id_env]) <= 0:
+                    raise ValueError
+            except ValueError:
+                raise ConfigError("Нужен положительный TELEGRAM_CHAT_ID личного чата") from None
     return Config(accounts, service, telegram, summary)

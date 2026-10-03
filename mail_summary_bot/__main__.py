@@ -11,8 +11,8 @@ from .models import MailMessage
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Сводки двух почтовых ящиков в Telegram")
-    parser.add_argument("command", choices=["run", "once", "check", "demo", "chat-id"])
+    parser = argparse.ArgumentParser(description="Сводки одного или двух почтовых ящиков в Telegram")
+    parser.add_argument("command", choices=["run", "once", "check", "collect", "demo", "chat-id"])
     parser.add_argument("--config", default="config.toml")
     parser.add_argument("--env", default=".env")
     args = parser.parse_args()
@@ -55,10 +55,18 @@ def main():
                 else:
                     os.environ["TELEGRAM_CHAT_ID"] = saved
             return 0
-        config = load_config(args.config)
+        config = load_config(args.config, mail_only=args.command == "collect")
+        if args.command == "collect":
+            from .collector import Collector
+            collector = Collector(config)
+            try:
+                collector.run()
+            finally:
+                collector.close()
+            return 0
         if args.command == "check":
             print("Конфигурация и необходимые переменные заполнены. Это не проверка реальных подключений.")
-            print(f"2 ящика; schedule={config.service.schedule}; summary={config.summary.mode}; timezone={config.service.timezone}")
+            print(f"Ящиков: {len(config.accounts)}; schedule={config.service.schedule}; summary={config.summary.mode}; timezone={config.service.timezone}")
             return 0
         from .service import Service
         service = Service(config)
