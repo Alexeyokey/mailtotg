@@ -130,6 +130,39 @@ def _date(value: str, fallback: str) -> str:
     return ""
 
 
+def _fetch_records(data: list):
+    """Group IMAP metadata fragments, keeping literal contents separate.
+
+    imaplib returns each literal as (prefix, bytes), followed by a separate
+    trailer. UID/SIZE can occur in that trailer. A new sequence-number prefix
+    begins another FETCH response, including an unsolicited one.
+    """
+    headers: list[bytes] = []
+    literals: list[tuple[bytes, bytes]] = []
+    for item in data:
+        header = item[0] if isinstance(item, tuple) and item else item
+        if not isinstance(header, bytes):
+            continue
+        if re.match(rb"^\d+\s+\(", header):
+            if headers:
+                yield b" ".join(headers), literals
+            headers, literals = [], []
+        elif not headers:
+            continue
+        headers.append(header)
+        if isinstance(item, tuple) and len(item) >= 2 and isinstance(item[1], bytes):
+            literals.append((header, item[1]))
+    if headers:
+        yield b" ".join(headers), literals
+
+
+def _fetch_number(header: bytes, name: bytes) -> int | None:
+    # Quoted strings belong to values (e.g. dates/envelopes), not attributes.
+    attributes = re.sub(rb'"(?:[^"\\]|\\.)*"', b'""', header)
+    found = re.search(rb"\b" + re.escape(name) + rb"\s+(\d+)\b", attributes, re.I)
+    return int(found.group(1)) if found else None
+
+
 def parse_message(
     raw: bytes,
     *,
@@ -200,15 +233,12 @@ class MailReader:
 
     @staticmethod
     def _metadata(data: list, uid: int) -> tuple[int, str]:
-        for item in data:
-            header = item[0] if isinstance(item, tuple) else item
-            if not isinstance(header, bytes):
-                continue
-            match_uid = re.search(rb"\bUID\s+(\d+)\b", header, re.I)
-            size = re.search(rb"\bRFC822\.SIZE\s+(\d+)\b", header, re.I)
+        for header, _ in _fetch_records(data):
+            match_uid = _fetch_number(header, b"UID")
+            size = _fetch_number(header, b"RFC822.SIZE")
             date = re.search(rb'\bINTERNALDATE\s+"([^"]+)"', header, re.I)
-            if match_uid and int(match_uid.group(1)) == uid and size:
-                return int(size.group(1)), _decode_bytes(date.group(1), "ascii") if date else ""
+            if match_uid == uid and size is not None:
+                return size, _decode_bytes(date.group(1), "ascii") if date else ""
         raise MailReadError("Incomplete IMAP message metadata.")
 
     def _message(self, client: imaplib.IMAP4_SSL, epoch: int, uid: int) -> MailMessage:
@@ -222,15 +252,23 @@ class MailReader:
             client, "fetch", str(uid), f"(UID INTERNALDATE RFC822.SIZE BODY.PEEK[]<0.{limit}>)"
         )
         raw = None
-        for item in data:
-            if not isinstance(item, tuple) or len(item) < 2:
+        for response, literals in _fetch_records(data):
+            if _fetch_number(response, b"UID") != uid:
                 continue
-            response, payload = item[0], item[1]
-            if not isinstance(response, bytes) or not isinstance(payload, bytes):
-                continue
-            found_uid = re.search(rb"\bUID\s+(\d+)\b", response, re.I)
-            if found_uid and int(found_uid.group(1)) == uid:
-                raw = payload
+            for prefix, payload in literals:
+                if re.search(rb"\bBODY(?:\.PEEK)?\[\](?:<0>)?(?:\s|$)", prefix, re.I):
+                    raw = payload
+                    break
+            if raw is not None:
+                # Providers may return a different RFC822.SIZE with the body
+                # than with the preceding metadata request. Use the size paired
+                # with this literal, retaining the earlier one only as fallback.
+                current_size = _fetch_number(response, b"RFC822.SIZE")
+                if current_size is not None:
+                    size = current_size
+                current_date = re.search(rb'\bINTERNALDATE\s+"([^"]+)"', response, re.I)
+                if current_date:
+                    internaldate = _decode_bytes(current_date.group(1), "ascii")
                 break
         if raw is None:
             raise MailReadError("IMAP message content was not returned.")

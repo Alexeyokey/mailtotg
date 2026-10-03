@@ -324,6 +324,124 @@ class IMAPPollingTests(unittest.TestCase):
         with self.assertRaises(MailReadError):
             self.poll(fake, (7, 10))
 
+    def test_body_fetch_current_size_overrides_stale_larger_metadata_size(self):
+        fake = FakeIMAP(messages={11: self.raw})
+        original = fake.uid
+
+        def stale_metadata(command, *args):
+            status, data = original(command, *args)
+            if command == "fetch" and "BODY.PEEK" not in args[1]:
+                data[0] = data[0].replace(
+                    f"RFC822.SIZE {len(self.raw)}".encode(),
+                    f"RFC822.SIZE {len(self.raw) + 100}".encode(),
+                )
+            return status, data
+
+        fake.uid = stale_metadata
+        result = self.poll(fake, (7, 10))
+        self.assertEqual(result.last_uid, 11)
+        self.assertEqual(result.messages[0].body, "Обычное письмо")
+        self.assertNotIn(RAW_TRUNCATION_NOTICE, result.messages[0].body)
+
+    def test_body_fetch_current_larger_size_still_rejects_incomplete_content(self):
+        fake = FakeIMAP(messages={11: self.raw})
+        original = fake.uid
+
+        def larger_current_size(command, *args):
+            status, data = original(command, *args)
+            if command == "fetch" and "BODY.PEEK" in args[1]:
+                header, payload = data[0]
+                header = header.replace(
+                    f"RFC822.SIZE {len(self.raw)}".encode(),
+                    f"RFC822.SIZE {len(self.raw) + 10}".encode(),
+                )
+                data[0] = (header, payload)
+            return status, data
+
+        fake.uid = larger_current_size
+        with self.assertRaisesRegex(MailReadError, "content was incomplete"):
+            self.poll(fake, (7, 10))
+
+    def test_body_without_current_size_uses_metadata_for_completeness(self):
+        for shortened in (False, True):
+            with self.subTest(shortened=shortened):
+                fake = FakeIMAP(messages={11: self.raw})
+                original = fake.uid
+
+                def missing_current_size(command, *args):
+                    status, data = original(command, *args)
+                    if command == "fetch" and "BODY.PEEK" in args[1]:
+                        header, payload = data[0]
+                        header = re.sub(rb"RFC822\.SIZE \d+ ?", b"", header)
+                        data[0] = (header, payload[:-10] if shortened else payload)
+                    return status, data
+
+                fake.uid = missing_current_size
+                if shortened:
+                    with self.assertRaisesRegex(MailReadError, "content was incomplete"):
+                        self.poll(fake, (7, 10))
+                else:
+                    self.assertEqual(self.poll(fake, (7, 10)).last_uid, 11)
+
+    def test_body_literal_can_precede_uid_and_size_in_same_fetch_response(self):
+        fake = FakeIMAP(messages={11: self.raw})
+        original = fake.uid
+
+        def trailing_metadata(command, *args):
+            status, data = original(command, *args)
+            if command == "fetch" and "BODY.PEEK" in args[1]:
+                payload = data[0][1]
+                data = [
+                    (f"11 (BODY[]<0> {{{len(payload)}}}".encode(), payload),
+                    f" UID 11 RFC822.SIZE {len(payload)})".encode(),
+                ]
+            return status, data
+
+        fake.uid = trailing_metadata
+        result = self.poll(fake, (7, 10))
+        self.assertEqual(result.messages[0].body, "Обычное письмо")
+        self.assertEqual(result.last_uid, 11)
+
+    def test_unsolicited_other_uid_body_is_not_assigned_to_requested_uid(self):
+        fake = FakeIMAP(messages={11: self.raw})
+        original = fake.uid
+
+        def unrelated_body(command, *args):
+            status, data = original(command, *args)
+            if command == "fetch" and "BODY.PEEK" in args[1]:
+                data = [
+                    (f"12 (BODY[]<0> {{{len(self.raw)}}}".encode(), self.raw),
+                    f" UID 12 RFC822.SIZE {len(self.raw)})".encode(),
+                    f"11 (UID 11 RFC822.SIZE {len(self.raw)})".encode(),
+                ]
+            return status, data
+
+        fake.uid = unrelated_body
+        with self.assertRaisesRegex(MailReadError, "content was not returned"):
+            self.poll(fake, (7, 10))
+
+    def test_unsolicited_other_uid_size_does_not_override_requested_body_size(self):
+        fake = FakeIMAP(messages={11: self.raw})
+        original = fake.uid
+        other = raw_email("Другое письмо").as_bytes(policy=policy.SMTP)
+
+        def other_response_before_and_after(command, *args):
+            status, data = original(command, *args)
+            if command == "fetch" and "BODY.PEEK" in args[1]:
+                data = [
+                    (f"12 (BODY[]<0> {{{len(other)}}}".encode(), other),
+                    f" UID 12 RFC822.SIZE {len(other) + 100})".encode(),
+                    (f"11 (BODY[]<0> {{{len(self.raw)}}}".encode(), self.raw),
+                    f" UID 11 RFC822.SIZE {len(self.raw)})".encode(),
+                    b"13 (UID 13 RFC822.SIZE 99999 FLAGS ())",
+                ]
+            return status, data
+
+        fake.uid = other_response_before_and_after
+        result = self.poll(fake, (7, 10))
+        self.assertEqual(result.messages[0].body, "Обычное письмо")
+        self.assertNotIn(RAW_TRUNCATION_NOTICE, result.messages[0].body)
+
     def test_authentication_errors_never_expose_server_reply(self):
         fake = FakeIMAP(auth_error=True)
         with self.assertRaises(MailReadError) as error:
