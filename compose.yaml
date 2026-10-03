@@ -1,0 +1,29 @@
+services:
+  bot:
+    build: .
+    restart: unless-stopped
+    env_file: .env
+    volumes:
+      - ./config.toml:/app/config.toml:ro
+      - state:/app/data
+    read_only: true
+    tmpfs:
+      - /tmp
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    stop_grace_period: 30s
+    networks:
+      - bot-egress
+    logging:
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+volumes:
+  state:
+
+networks:
+  bot-egress:
+    driver: bridge

@@ -1,0 +1,49 @@
+[service]
+database = "data/state.sqlite3"
+poll_seconds = 60
+# daily / interval / manual. /summary работает в любом режиме.
+schedule = "daily"
+digest_time = "09:00"
+timezone = "Europe/Moscow"
+digest_interval_minutes = 60
+# new: только письма после первого запуска, lookback: последние N суток.
+bootstrap = "new"
+lookback_days = 1
+max_messages_per_poll = 100
+max_digest_messages = 30
+max_body_chars = 12000
+max_email_bytes = 2000000
+retention_days = 30
+
+[telegram]
+token_env = "TELEGRAM_BOT_TOKEN"
+chat_id_env = "TELEGRAM_CHAT_ID"
+proxy_env = "TELEGRAM_PROXY_URL"
+poll_timeout_seconds = 10
+
+[summary]
+# extractive: короткие выдержки без модели; openai: AI через Responses API;
+# ollama: AI на собственном сервере через /api/chat.
+mode = "extractive"
+model_env = "SUMMARY_MODEL"
+endpoint_env = "SUMMARY_API_URL"
+api_key_env = "SUMMARY_API_KEY"
+proxy_env = "SUMMARY_PROXY_URL"
+timeout_seconds = 120
+max_input_chars = 60000
+
+[[accounts]]
+id = "personal"
+host = "imap.gmail.com"
+port = 993
+username = "your-name@gmail.com"
+password_env = "MAIL_1_PASSWORD"
+mailbox = "INBOX"
+
+[[accounts]]
+id = "work"
+host = "imap.yandex.ru"
+port = 993
+username = "your-name@yandex.ru"
+password_env = "MAIL_2_PASSWORD"
+mailbox = "INBOX"
