@@ -1,6 +1,8 @@
 [service]
 database = "data/state.sqlite3"
 poll_seconds = 60
+# Уведомление о каждом новом письме; не исключает его из сводки.
+notify_new_mail = false
 # daily / interval / manual. /summary работает в любом режиме.
 schedule = "daily"
 digest_time = "09:00"

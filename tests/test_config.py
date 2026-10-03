@@ -31,6 +31,18 @@ class ConfigTests(unittest.TestCase):
         self.one_account()
         self.assertEqual(len(load_config(self.config, secrets=False).accounts), 1)
 
+    def test_notifications_default_disabled_and_accept_boolean(self):
+        self.assertFalse(load_config(self.config, secrets=False).service.notify_new_mail)
+        self.config.write_text(BASE.read_text().replace('notify_new_mail = false', 'notify_new_mail = true'))
+        self.assertTrue(load_config(self.config, secrets=False).service.notify_new_mail)
+
+    def test_notifications_reject_string_and_integer_values(self):
+        for value in ('"true"', '1'):
+            with self.subTest(value=value):
+                self.config.write_text(BASE.read_text().replace('notify_new_mail = false', 'notify_new_mail = ' + value))
+                with self.assertRaisesRegex(ConfigError, 'notify_new_mail'):
+                    load_config(self.config, secrets=False)
+
     def test_zero_accounts_are_rejected(self):
         self.config.write_text(BASE.read_text().split('[[accounts]]')[0], encoding="utf-8")
         with self.assertRaisesRegex(ConfigError, "один или два"):

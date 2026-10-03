@@ -64,6 +64,28 @@ class TelegramTests(unittest.TestCase):
             "offset": 18, "timeout": 10, "allowed_updates": ["message"],
         })
 
+    def test_zero_timeout_does_not_wait_while_notifications_are_queued(self):
+        requests = []
+        def handler(request):
+            requests.append(request)
+            return httpx.Response(200, json={"ok": True, "result": []})
+        client = self.client(handler)
+        self.assertEqual(client.get_updates(3, timeout=0), [])
+        self.assertEqual(json.loads(requests[0].content)['timeout'], 0)
+        for value in (-1, 51, True, "0"):
+            with self.subTest(value=value), self.assertRaises(TelegramError):
+                client.get_updates(3, timeout=value)
+        self.assertEqual(len(requests), 1)
+
+    def test_send_requires_real_message_acknowledgement(self):
+        for result in ({}, [], None, {'message_id': True}, {'message_id': 0}, {'message_id': '2'}):
+            with self.subTest(result=result):
+                client = self.client(lambda request: httpx.Response(200, json={"ok": True, "result": result}))
+                with self.assertRaises(TelegramError):
+                    client.send_chunk('Тест')
+        client = self.client(lambda request: httpx.Response(200, json={"ok": True, "result": {'message_id': 2}}))
+        self.assertEqual(client.send_chunk('Тест'), 2)
+
     def test_429_returns_retry_after_without_echoing_response(self):
         secret = "111:SECRET_abcdef https://secret.invalid private response"
         client = self.client(lambda request: httpx.Response(429, json={

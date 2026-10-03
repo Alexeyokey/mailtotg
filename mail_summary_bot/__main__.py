@@ -73,6 +73,11 @@ def main():
         try:
             if args.command == "once":
                 service.poll_mail()
+                while service.store.notification_outbox():
+                    time.sleep(1.1)
+                    if not service.deliver_notifications(time.time()):
+                        print("Уведомление сохранено для повторной доставки.")
+                        return 2
                 service.request_digest()
                 while True:
                     built = service.build_digest(time.time())

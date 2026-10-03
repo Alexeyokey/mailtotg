@@ -6,6 +6,7 @@ import json
 import logging
 import time
 import math
+import re
 
 from .config import Config
 from .mail import MailReader
@@ -29,6 +30,22 @@ def next_daily(now: float, clock: str, timezone: str) -> float:
 def account_binding(account) -> str:
     identity = json.dumps([account.host, account.port, account.username, account.mailbox])
     return hashlib.sha256(identity.encode()).hexdigest()
+
+
+def notification_text(message) -> str:
+    """Bounded plain-text notice; mail content remains data and never executes."""
+    def excerpt(value, limit):
+        value = re.sub(r"\s+", " ", value).strip()
+        return value[:limit] + ("…" if len(value) > limit else "")
+
+    return "\n".join([
+        "✉️ Новое письмо · " + excerpt(message.account_id, 64),
+        "От: " + (excerpt(message.sender, 256) or "(не указан)"),
+        "Тема: " + (excerpt(message.subject, 512) or "(без темы)"),
+        "Дата: " + (excerpt(message.date, 80) or "(не указана)"),
+        "", excerpt(message.body, 450) or "(Текст письма отсутствует.)",
+        "", "Краткая выдержка; полный текст — в почте. Письмо также войдёт в сводку.",
+    ])
 
 
 class Service:
@@ -75,7 +92,11 @@ class Service:
                     days = math.ceil(max(0, time.time() - float(previous_poll)) / 86400) + 1
                     reader.settings = replace(self.config.service, lookback_days=max(self.config.service.lookback_days, days))
                 result = reader.poll(checkpoint)
-                self.store.save_poll(account.id, binding, result)
+                self.store.save_poll(
+                    account.id, binding, result,
+                    notification_parts=(lambda mail: split_message(notification_text(mail)))
+                    if self.config.service.notify_new_mail else None,
+                )
                 if result.epoch_changed:
                     self.store.set(f"epoch_notice:{account.id}", "1")
                     LOG.warning("Mailbox %s: identity epoch changed; recovering recent mail", account.id)
@@ -134,9 +155,27 @@ class Service:
             LOG.warning("Telegram delivery deferred (%s)", type(error).__name__)
             return False
 
+    def deliver_notifications(self, now: float):
+        notice = self.store.notification_outbox()
+        if notice is None or now < max(notice["retry_at"], self.next_send_at):
+            return False
+        try:
+            self.telegram.send_chunk(notice["parts"][notice["sent_parts"]])
+            self.store.notification_part_sent(notice["message_id"])
+            self.next_send_at = time.time() + 1.1
+            LOG.info("Telegram mail notification %s: delivered part %s/%s",
+                     notice["message_id"], notice["sent_parts"] + 1, len(notice["parts"]))
+            return True
+        except Exception as error:
+            self.store.notification_failed(notice["message_id"], getattr(error, "retry_after", None))
+            LOG.warning("Mail notification deferred (%s)", type(error).__name__)
+            return False
+
     def status_text(self):
         stats = self.store.stats()
         lines = ["Почтовая сводка", f"Ожидают сводки: {stats['pending']}", f"Ожидают доставки: {stats['queued']}", f"Режим: {self.config.summary.mode}"]
+        lines.append("Уведомления о новых письмах: " + ("включены" if self.config.service.notify_new_mail else "выключены"))
+        lines.append(f"Ожидают уведомления: {self.store.notification_stats()['pending']}")
         zone = ZoneInfo(self.config.service.timezone)
         for account in self.config.accounts:
             stamp = self.store.get(f"last_poll:{account.id}")
@@ -149,7 +188,10 @@ class Service:
     def commands(self):
         offset = int(self.store.get("telegram_offset", 0))
         try:
-            updates = self.telegram.get_updates(offset)
+            if self.store.notification_outbox():
+                updates = self.telegram.get_updates(offset, timeout=0)
+            else:
+                updates = self.telegram.get_updates(offset)
         except Exception as error:
             LOG.warning("Telegram polling unavailable (%s)", type(error).__name__)
             return
@@ -194,6 +236,7 @@ class Service:
         if self.config.service.schedule != "manual" and due and now >= due:
             self.request_digest()
             self.advance_schedule(now)
+        self.deliver_notifications(time.time())
         if poll_commands:
             self.commands()
         now = time.time()

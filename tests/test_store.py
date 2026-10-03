@@ -4,6 +4,7 @@ from dataclasses import replace
 from pathlib import Path
 import tempfile
 import unittest
+from unittest.mock import patch
 
 from mail_summary_bot.models import MailMessage, PollResult
 from mail_summary_bot.store import Store
@@ -143,6 +144,175 @@ class StoreTests(unittest.TestCase):
         self.reopen()
         self.assertEqual(self.store.stats(), {"pending": 1, "queued": 1, "sent": 0})
         self.assertIsNotNone(self.store.outbox())
+
+    def test_notification_migration_and_enabling_never_replay_backlog(self):
+        self.store.save_poll("first", "binding", PollResult(41, 1, [mail()]))
+        # Simulate a deployed database created before notifications existed.
+        with self.store.db:
+            self.store.db.execute("DROP TABLE notifications")
+        self.reopen()
+        self.assertEqual(self.store.notification_stats(), {"pending": 0, "sent": 0})
+        formatted = []
+
+        def notice(message):
+            formatted.append(message.uid)
+            return [f"Новое письмо {message.uid}"]
+
+        self.store.save_poll("first", "binding", PollResult(41, 2, [mail(), mail(uid=2)]), notification_parts=notice)
+        self.assertEqual(formatted, [2])
+        self.assertEqual(self.store.stats(), {"pending": 2, "queued": 0, "sent": 0})
+        self.assertEqual(self.store.notification_stats(), {"pending": 1, "sent": 0})
+        self.assertEqual(self.store.notification_outbox()["parts"], ["Новое письмо 2"])
+
+    def test_formatter_failure_rolls_back_new_mail_notices_identities_and_cursor(self):
+        self.store.save_poll("first", "binding", PollResult(41, 1, [mail()]))
+
+        def notice(message):
+            if message.uid == 3:
+                raise RuntimeError("Formatter failed")
+            return ["Уведомление"]
+
+        with self.assertRaises(RuntimeError):
+            self.store.save_poll("first", "binding", PollResult(41, 3, [mail(uid=2), mail(uid=3)]), notification_parts=notice)
+        self.reopen()
+        self.assertEqual(self.store.checkpoint("first", "binding"), (41, 1))
+        self.assertEqual([message.uid for _, message in self.store.pending(10, ("first",))], [1])
+        self.assertIsNone(self.store.notification_outbox())
+        self.assertEqual(self.store.db.execute("SELECT COUNT(*) FROM mail_identities").fetchone()[0], 1)
+        self.store.save_poll("first", "binding", PollResult(41, 3, [mail(uid=2), mail(uid=3)]), notification_parts=lambda message: ["Уведомление"])
+        self.assertEqual(self.store.notification_stats()["pending"], 2)
+
+    def test_invalid_notification_parts_roll_back_mail_and_checkpoint(self):
+        for parts in ([], [""], [42], "Уведомление", None):
+            with self.subTest(parts=parts):
+                with self.assertRaises(ValueError):
+                    self.store.save_poll("first", "binding", PollResult(41, 1, [mail()]), notification_parts=lambda message: parts)
+                self.assertIsNone(self.store.checkpoint("first", "binding"))
+                self.assertEqual(self.store.stats()["pending"], 0)
+                self.assertEqual(self.store.notification_stats()["pending"], 0)
+
+    def test_notification_dedup_by_stable_identity_across_epoch_change(self):
+        original = mail()
+        formatted = []
+
+        def notice(message):
+            formatted.append(message.uid)
+            return ["Уведомление"]
+
+        self.store.save_poll("first", "binding", PollResult(41, 1, [original]), notification_parts=notice)
+        self.store.save_poll("first", "binding", PollResult(41, 1, [original]), notification_parts=notice)
+        replay = replace(original, uidvalidity=42, uid=9)
+        self.store.save_poll("first", "binding", PollResult(42, 9, [replay]), notification_parts=notice)
+        self.reopen()
+        self.assertEqual(formatted, [1])
+        self.assertEqual(self.store.notification_stats(), {"pending": 1, "sent": 0})
+        self.assertEqual(self.store.checkpoint("first", "binding"), (42, 9))
+
+    def test_notification_dedup_by_uid_without_message_id(self):
+        original = replace(mail(), message_id="")
+        formatted = []
+
+        def notice(message):
+            formatted.append(message.body)
+            return ["Уведомление"]
+
+        self.store.save_poll("first", "binding", PollResult(41, 1, [original]), notification_parts=notice)
+        self.store.save_poll("first", "binding", PollResult(41, 1, [replace(original, body="Повтор UID")]), notification_parts=notice)
+        self.assertEqual(formatted, [original.body])
+        self.assertEqual(self.store.notification_stats()["pending"], 1)
+
+    def test_notifications_are_independent_for_two_accounts(self):
+        original = mail()
+        notice = lambda message: [f"Письмо из {message.account_id}"]
+        self.store.save_poll("first", "first-binding", PollResult(41, 1, [original]), notification_parts=notice)
+        self.store.save_poll("second", "second-binding", PollResult(41, 1, [replace(original, account_id="second")]), notification_parts=notice)
+        first = self.store.notification_outbox()
+        self.store.notification_part_sent(first["message_id"])
+        second = self.store.notification_outbox()
+        self.assertNotEqual(first["message_id"], second["message_id"])
+        self.assertEqual(second["parts"], ["Письмо из second"])
+        self.assertEqual(self.store.notification_stats(), {"pending": 1, "sent": 1})
+
+    def test_partial_notification_and_retry_survive_reopen_without_affecting_digest(self):
+        self.store.save_poll("first", "binding", PollResult(41, 1, [mail()]), notification_parts=lambda message: ["Часть 1", "Часть 2"])
+        notice = self.store.notification_outbox()
+        self.store.notification_part_sent(notice["message_id"])
+        with patch("mail_summary_bot.store.time.time", return_value=1000):
+            self.store.notification_failed(notice["message_id"], retry_after=90)
+        self.reopen()
+        notice = self.store.notification_outbox()
+        self.assertEqual(notice["sent_parts"], 1)
+        self.assertEqual(notice["parts"], ["Часть 1", "Часть 2"])
+        self.assertEqual(notice["attempts"], 1)
+        self.assertEqual(notice["retry_at"], 1090)
+        self.assertEqual(self.store.stats(), {"pending": 1, "queued": 0, "sent": 0})
+        self.store.notification_part_sent(notice["message_id"])
+        self.reopen()
+        self.assertIsNone(self.store.notification_outbox())
+        self.assertEqual(self.store.notification_stats(), {"pending": 0, "sent": 1})
+        self.assertEqual(self.store.stats(), {"pending": 1, "queued": 0, "sent": 0})
+        row = self.store.db.execute("SELECT attempts,retry_at FROM notifications").fetchone()
+        self.assertEqual(tuple(row), (0, 0))
+        digest_id = self.store.queue_digest([notice["message_id"]], ["Утренняя сводка"])
+        self.store.part_sent(digest_id)
+        self.assertEqual(self.store.stats(), {"pending": 0, "queued": 0, "sent": 1})
+
+    def test_notification_backoff_and_unknown_or_completed_notice(self):
+        self.store.save_poll("first", "binding", PollResult(41, 1, [mail()]), notification_parts=lambda message: ["Уведомление"])
+        notice_id = self.store.notification_outbox()["message_id"]
+        with patch("mail_summary_bot.store.time.time", return_value=1000):
+            self.store.notification_failed(notice_id)
+            self.assertEqual(self.store.notification_outbox()["retry_at"], 1002)
+            self.store.notification_failed(notice_id)
+            self.assertEqual(self.store.notification_outbox()["retry_at"], 1004)
+            for _ in range(20):
+                self.store.notification_failed(notice_id)
+            self.assertEqual(self.store.notification_outbox()["retry_at"], 3048)
+        with self.assertRaises(ValueError):
+            self.store.notification_failed(notice_id + 1000)
+        with self.assertRaises(ValueError):
+            self.store.notification_part_sent(notice_id + 1000)
+        self.store.notification_part_sent(notice_id)
+        with self.assertRaises(ValueError):
+            self.store.notification_failed(notice_id)
+        with self.assertRaises(ValueError):
+            self.store.notification_part_sent(notice_id)
+
+    def test_prune_keeps_digest_sent_mail_and_identity_with_pending_notification(self):
+        self.store.save_poll("first", "binding", PollResult(41, 1, [mail()]), notification_parts=lambda message: ["Уведомление"])
+        notice_id = self.store.notification_outbox()["message_id"]
+        digest_id = self.store.queue_digest([notice_id], ["Утренняя сводка"])
+        self.store.part_sent(digest_id)
+        with self.store.db:
+            self.store.db.execute("UPDATE messages SET created_at=0")
+            self.store.db.execute("UPDATE digests SET created_at=0")
+            self.store.db.execute("UPDATE notifications SET created_at=0")
+            self.store.db.execute("UPDATE mail_identities SET created_at=0")
+        self.store.prune(1)
+        self.reopen()
+        self.assertEqual(self.store.stats(), {"pending": 0, "queued": 0, "sent": 1})
+        self.assertEqual(self.store.notification_stats(), {"pending": 1, "sent": 0})
+        self.assertEqual(self.store.db.execute("SELECT COUNT(*) FROM mail_identities").fetchone()[0], 1)
+        self.store.notification_part_sent(notice_id)
+        self.assertEqual(self.store.stats()["sent"], 1)
+        self.store.prune(1)
+        self.reopen()
+        self.assertEqual(self.store.stats(), {"pending": 0, "queued": 0, "sent": 0})
+        self.assertEqual(self.store.notification_stats(), {"pending": 0, "sent": 0})
+        self.assertEqual(self.store.db.execute("SELECT COUNT(*) FROM mail_identities").fetchone()[0], 0)
+
+    def test_prune_completed_notice_does_not_discard_pending_digest_mail(self):
+        self.store.save_poll("first", "binding", PollResult(41, 1, [mail()]), notification_parts=lambda message: ["Уведомление"])
+        notice_id = self.store.notification_outbox()["message_id"]
+        self.store.notification_part_sent(notice_id)
+        with self.store.db:
+            self.store.db.execute("UPDATE messages SET created_at=0")
+            self.store.db.execute("UPDATE notifications SET created_at=0")
+        self.store.prune(1)
+        self.reopen()
+        self.assertEqual(self.store.stats(), {"pending": 1, "queued": 0, "sent": 0})
+        self.assertEqual(self.store.notification_stats(), {"pending": 0, "sent": 0})
+        self.assertEqual(self.store.pending(1, ("first",))[0][0], notice_id)
 
 
 if __name__ == "__main__":

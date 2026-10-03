@@ -49,13 +49,18 @@ class FakeTelegram:
         self.attempts = []
         self.sent = []
         self.replies = []
+        self.timeouts = []
+        self.events = []
 
-    def get_updates(self, offset):
+    def get_updates(self, offset, *, timeout=None):
         self.offsets.append(offset)
+        self.timeouts.append(timeout)
+        self.events.append(("get_updates", offset, timeout))
         return self.updates
 
     def send_chunk(self, text):
         self.attempts.append(text)
+        self.events.append(("send_chunk", text))
         outcome = self.outcomes.pop(0) if self.outcomes else None
         if outcome:
             raise outcome
@@ -109,6 +114,178 @@ class ServiceTests(unittest.TestCase):
     def save_mail(self, message):
         account = next(a for a in self.accounts if a.id == message.account_id)
         self.store.save_poll(account.id, account_binding(account), PollResult(message.uidvalidity, message.uid, [message]))
+
+    def enable_notifications(self):
+        self.config = replace(self.config, service=replace(self.config.service, notify_new_mail=True))
+        self.service.config = self.config
+
+    def reopen_service(self):
+        self.service.close()
+        self.store = Store(self.path)
+        self.telegram = FakeTelegram()
+        self.service = self.make_service()
+
+    def test_discovered_mail_is_notified_and_remains_pending_for_digest(self):
+        self.enable_notifications()
+        discovered = mail(uid=7)
+        self.readers[0].result = PollResult(41, 7, [discovered])
+        with patch("mail_summary_bot.service.time.time", return_value=1000):
+            self.service.poll_mail()
+            self.assertTrue(self.service.deliver_notifications(1000))
+        self.assertEqual(len(self.telegram.sent), 1)
+        self.assertIn(discovered.sender, self.telegram.sent[0])
+        self.assertIn(discovered.subject, self.telegram.sent[0])
+        self.assertIn(discovered.body, self.telegram.sent[0])
+        self.assertIsNone(self.store.notification_outbox())
+        self.assertEqual(self.store.stats(), {"pending": 1, "queued": 0, "sent": 0})
+        self.assertEqual(self.summarizer.calls, [])
+
+    def test_notifications_are_disabled_by_default(self):
+        self.readers[0].result = PollResult(41, 7, [mail(uid=7)])
+        self.service.poll_mail()
+        self.assertIsNone(self.store.notification_outbox())
+        self.assertFalse(self.service.deliver_notifications(1000))
+        self.assertEqual(self.telegram.sent, [])
+        self.assertEqual(self.store.stats()["pending"], 1)
+
+    def test_repeated_imap_results_do_not_replay_notification(self):
+        self.enable_notifications()
+        self.readers[0].result = PollResult(41, 7, [mail(uid=7)])
+        with patch("mail_summary_bot.service.time.time", return_value=1000):
+            self.service.poll_mail()
+            self.service.poll_mail()
+            self.assertTrue(self.service.deliver_notifications(1000))
+            self.service.poll_mail()
+        self.assertFalse(self.service.deliver_notifications(1002))
+        self.assertEqual(len(self.telegram.sent), 1)
+        self.assertEqual(self.store.stats()["pending"], 1)
+
+    def test_enabling_notifications_does_not_replay_existing_digest_backlog(self):
+        old = replace(mail(uid=1), subject="Уже сохранённое письмо")
+        new = replace(mail(uid=2), subject="Впервые обнаруженное письмо")
+        self.save_mail(old)
+        self.enable_notifications()
+        self.readers[0].result = PollResult(41, 2, [old, new])
+        with patch("mail_summary_bot.service.time.time", return_value=1000):
+            self.service.poll_mail()
+            self.assertTrue(self.service.deliver_notifications(1000))
+        self.assertIn(new.subject, self.telegram.sent[0])
+        self.assertNotIn(old.subject, self.telegram.sent[0])
+        self.assertIsNone(self.store.notification_outbox())
+        self.assertEqual(self.store.stats()["pending"], 2)
+
+    def test_successful_notification_does_not_remove_mail_from_daily_digest(self):
+        self.enable_notifications()
+        discovered = mail(uid=7)
+        self.readers[0].result = PollResult(41, 7, [discovered])
+        with patch("mail_summary_bot.service.time.time", return_value=1000):
+            self.service.poll_mail()
+            self.assertTrue(self.service.deliver_notifications(1000))
+            self.service.request_digest()
+            self.assertTrue(self.service.build_digest(1000))
+        self.assertEqual(self.summarizer.calls, [[discovered]])
+        self.assertFalse(self.service.deliver(1001))
+        with patch("mail_summary_bot.service.time.time", return_value=1002):
+            self.assertTrue(self.service.deliver(1002))
+        self.assertEqual(len(self.telegram.sent), 2)
+        self.assertIn("Сводка почты", self.telegram.sent[1])
+        self.assertEqual(self.store.stats(), {"pending": 0, "queued": 0, "sent": 1})
+
+    def test_six_am_moscow_digest_remains_scheduled_when_notifications_are_enabled(self):
+        self.enable_notifications()
+        self.config = replace(self.config, service=replace(self.config.service, schedule="daily", digest_time="06:00", timezone="Europe/Moscow"))
+        self.service.config = self.config
+        due = datetime(2026, 10, 4, 3, 0, tzinfo=timezone.utc).timestamp()
+        tomorrow = datetime(2026, 10, 5, 3, 0, tzinfo=timezone.utc).timestamp()
+        self.store.set("next_due", due)
+        discovered = mail(uid=7)
+        self.readers[0].result = PollResult(41, 7, [discovered])
+        with patch("mail_summary_bot.service.time.time", return_value=due), patch("mail_summary_bot.service.time.monotonic", return_value=100):
+            self.service.tick(poll_commands=False)
+        self.assertEqual(float(self.store.get("next_due")), tomorrow)
+        self.assertEqual(self.summarizer.calls, [[discovered]])
+        self.assertEqual(len(self.telegram.sent), 1)
+        self.assertIn("Новое письмо", self.telegram.sent[0])
+        self.assertIsNotNone(self.store.outbox())
+        with patch("mail_summary_bot.service.time.time", return_value=due + 2), patch("mail_summary_bot.service.time.monotonic", return_value=102):
+            self.service.tick(poll_commands=False)
+        self.assertEqual(len(self.telegram.sent), 2)
+        self.assertIn("Сводка почты · 04.10.2026 06:00", self.telegram.sent[1])
+        self.assertEqual(self.store.stats()["sent"], 1)
+
+    def test_failed_notification_survives_restart_and_respects_retry_delay(self):
+        self.enable_notifications()
+        self.readers[0].result = PollResult(41, 7, [mail(uid=7)])
+        self.telegram.outcomes = [TelegramError("private-notice-content", retry_after=30)]
+        with patch("mail_summary_bot.service.time.time", return_value=1000):
+            self.service.poll_mail()
+            with self.assertLogs("mail_summary_bot.service", level="WARNING") as logs:
+                self.assertFalse(self.service.deliver_notifications(1000))
+        self.assertNotIn("private-notice-content", "\n".join(logs.output))
+        self.assertEqual(self.store.stats()["pending"], 1)
+        self.reopen_service()
+        self.assertFalse(self.service.deliver_notifications(1029))
+        self.assertEqual(self.telegram.attempts, [])
+        with patch("mail_summary_bot.service.time.time", return_value=1031):
+            self.assertTrue(self.service.deliver_notifications(1031))
+        self.assertEqual(len(self.telegram.sent), 1)
+        self.assertIsNone(self.store.notification_outbox())
+        self.assertEqual(self.store.stats()["pending"], 1)
+
+    def test_notification_retry_does_not_block_ready_digest(self):
+        self.enable_notifications()
+        self.readers[0].result = PollResult(41, 7, [mail(uid=7)])
+        self.telegram.outcomes = [TelegramError("test failure", retry_after=30)]
+        with patch("mail_summary_bot.service.time.time", return_value=1000):
+            self.service.poll_mail()
+            with self.assertLogs("mail_summary_bot.service", level="WARNING"):
+                self.assertFalse(self.service.deliver_notifications(1000))
+            self.service.request_digest()
+            self.assertTrue(self.service.build_digest(1000))
+        with patch("mail_summary_bot.service.time.time", return_value=1002):
+            self.assertFalse(self.service.deliver_notifications(1002))
+            self.assertTrue(self.service.deliver(1002))
+        self.assertIsNotNone(self.store.notification_outbox())
+        self.assertEqual(self.store.stats()["sent"], 1)
+
+    def test_first_discovered_notice_is_sent_before_command_poll_and_remaining_queue_uses_zero_timeout(self):
+        self.enable_notifications()
+        self.readers[0].result = PollResult(41, 2, [mail(uid=1), mail(uid=2)])
+        with patch("mail_summary_bot.service.time.time", return_value=1000), patch("mail_summary_bot.service.time.monotonic", return_value=100):
+            self.service.tick()
+        self.assertEqual([event[0] for event in self.telegram.events[:2]], ["send_chunk", "get_updates"])
+        self.assertEqual(self.telegram.timeouts, [0])
+        self.assertEqual(len(self.telegram.sent), 1)
+        self.assertIsNotNone(self.store.notification_outbox())
+
+    def test_command_poll_keeps_default_timeout_without_notification_queue(self):
+        self.service.commands()
+        self.assertEqual(self.telegram.timeouts, [None])
+
+    def test_multiple_notices_resume_only_unsent_mail_after_restart(self):
+        self.enable_notifications()
+        first = replace(mail(uid=1), subject="Первое новое письмо")
+        second = replace(mail(uid=2), subject="Второе новое письмо")
+        self.readers[0].result = PollResult(41, 2, [first, second])
+        self.telegram.outcomes = [None, TelegramError("test failure", retry_after=30)]
+        with patch("mail_summary_bot.service.time.time", return_value=1000):
+            self.service.poll_mail()
+            self.assertTrue(self.service.deliver_notifications(1000))
+        with patch("mail_summary_bot.service.time.time", return_value=1002):
+            with self.assertLogs("mail_summary_bot.service", level="WARNING"):
+                self.assertFalse(self.service.deliver_notifications(1002))
+        self.assertEqual(len(self.telegram.sent), 1)
+        self.assertIn(first.subject, self.telegram.sent[0])
+        self.reopen_service()
+        self.assertFalse(self.service.deliver_notifications(1031))
+        with patch("mail_summary_bot.service.time.time", return_value=1033):
+            self.assertTrue(self.service.deliver_notifications(1033))
+            self.service.poll_mail()
+        self.assertEqual(len(self.telegram.sent), 1)
+        self.assertIn(second.subject, self.telegram.sent[0])
+        self.assertNotIn(first.subject, self.telegram.sent[0])
+        self.assertIsNone(self.store.notification_outbox())
+        self.assertEqual(self.store.stats()["pending"], 2)
 
     def test_one_mailbox_failure_does_not_block_the_other(self):
         self.readers[0].error = RuntimeError("private-test-password")

@@ -23,6 +23,7 @@ class AccountConfig:
 class ServiceConfig:
     database: str = "data/state.sqlite3"
     poll_seconds: int = 60
+    notify_new_mail: bool = False
     schedule: str = "daily"
     digest_time: str = "09:00"
     timezone: str = "Europe/Moscow"
@@ -134,6 +135,8 @@ def load_config(path: str | Path, *, secrets: bool = True, mail_only: bool = Fal
     service = _section(ServiceConfig, data.get("service", {}))
     telegram = _section(TelegramConfig, data.get("telegram", {}))
     summary = _section(SummaryConfig, data.get("summary", {}))
+    if type(service.notify_new_mail) is not bool:
+        raise ConfigError("notify_new_mail должен быть true или false")
     if service.schedule not in {"daily", "interval", "manual"}:
         raise ConfigError("schedule: daily, interval или manual")
     if service.bootstrap not in {"new", "lookback"}:

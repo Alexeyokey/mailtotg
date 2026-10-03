@@ -88,20 +88,23 @@ class TelegramClient:
             )
         return data
 
-    def get_updates(self, offset: int) -> list[dict]:
+    def get_updates(self, offset: int, *, timeout: int | None = None) -> list[dict]:
+        timeout = self._poll_timeout if timeout is None else timeout
+        if type(timeout) is not int or not 0 <= timeout <= 50:
+            raise TelegramError("Недопустимое время ожидания Telegram.")
         data = self._request(
             "getUpdates",
-            {"offset": offset, "timeout": self._poll_timeout, "allowed_updates": ["message"]},
+            {"offset": offset, "timeout": timeout, "allowed_updates": ["message"]},
         )
         result = data.get("result")
         if not isinstance(result, list) or any(not isinstance(item, dict) for item in result):
             raise TelegramError("Telegram вернул некорректный список обновлений.")
         return result
 
-    def send_chunk(self, text: str) -> None:
+    def send_chunk(self, text: str) -> int:
         if not text or sum(2 if ord(character) > 0xFFFF else 1 for character in text) > 4000:
             raise TelegramError("Недопустимый размер сообщения Telegram.")
-        self._request(
+        data = self._request(
             "sendMessage",
             {
                 "chat_id": self.chat_id,
@@ -109,6 +112,11 @@ class TelegramClient:
                 "link_preview_options": {"is_disabled": True},
             },
         )
+        result = data.get("result")
+        message_id = result.get("message_id") if isinstance(result, dict) else None
+        if type(message_id) is not int or message_id <= 0:
+            raise TelegramError("Telegram не подтвердил отправку сообщения.")
+        return message_id
 
     def send_text(self, text: str) -> None:
         for chunk in split_message(text):

@@ -1,6 +1,7 @@
 """Durable IMAP cursors and an outbox; checkpoint and mail insert are atomic."""
 from dataclasses import asdict
 from pathlib import Path
+from collections.abc import Callable
 import json
 import fcntl
 import hashlib
@@ -47,12 +48,19 @@ class Store:
             attempts INTEGER NOT NULL DEFAULT 0, retry_at REAL NOT NULL DEFAULT 0,
             created_at REAL NOT NULL
         );
+        CREATE TABLE IF NOT EXISTS notifications (
+            message_id INTEGER PRIMARY KEY, parts TEXT NOT NULL,
+            sent_parts INTEGER NOT NULL DEFAULT 0, status TEXT NOT NULL DEFAULT 'pending',
+            attempts INTEGER NOT NULL DEFAULT 0, retry_at REAL NOT NULL DEFAULT 0,
+            created_at REAL NOT NULL
+        );
         CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
         CREATE TABLE IF NOT EXISTS mail_identities (
             account_id TEXT NOT NULL, fingerprint TEXT NOT NULL,
             created_at REAL NOT NULL, PRIMARY KEY(account_id, fingerprint)
         );
         CREATE INDEX IF NOT EXISTS messages_status ON messages(status, id);
+        CREATE INDEX IF NOT EXISTS notifications_status ON notifications(status, message_id);
         """)
         if path != ":memory:":
             os.chmod(path, 0o600)
@@ -82,7 +90,8 @@ class Store:
             return None
         return row["uidvalidity"], row["last_uid"]
 
-    def save_poll(self, account_id: str, binding: str, result: PollResult):
+    def save_poll(self, account_id: str, binding: str, result: PollResult, *,
+                  notification_parts: Callable[[MailMessage], list[str]] | None = None):
         with self.db:
             self.checkpoint(account_id, binding)
             if result.uidvalidity <= 0 or result.last_uid < 0:
@@ -99,7 +108,15 @@ class Store:
                     known = self.db.execute("INSERT OR IGNORE INTO mail_identities VALUES (?,?,?)", (account_id, fingerprint, time.time()))
                     if not known.rowcount:
                         continue
-                self.db.execute("INSERT OR IGNORE INTO messages(account_id,uidvalidity,uid,payload,created_at) VALUES (?,?,?,?,?)", (account_id, mail.uidvalidity, mail.uid, json.dumps(asdict(mail), ensure_ascii=False), time.time()))
+                inserted = self.db.execute("INSERT OR IGNORE INTO messages(account_id,uidvalidity,uid,payload,created_at) VALUES (?,?,?,?,?)", (account_id, mail.uidvalidity, mail.uid, json.dumps(asdict(mail), ensure_ascii=False), time.time()))
+                # Only a new insert gets a notice. Enabling notifications never
+                # replays stored backlog, and formatter errors roll back the
+                # mail, identity, outbox, and cursor as one transaction.
+                if inserted.rowcount and notification_parts is not None:
+                    parts = notification_parts(mail)
+                    if not isinstance(parts, list) or not parts or not all(isinstance(part, str) and part for part in parts):
+                        raise ValueError("Empty or invalid notification")
+                    self.db.execute("INSERT INTO notifications(message_id,parts,created_at) VALUES (?,?,?)", (inserted.lastrowid, json.dumps(parts, ensure_ascii=False), time.time()))
             self.db.execute("INSERT INTO checkpoints VALUES (?,?,?,?) ON CONFLICT(account_id) DO UPDATE SET binding=excluded.binding,uidvalidity=excluded.uidvalidity,last_uid=excluded.last_uid", (account_id, binding, result.uidvalidity, result.last_uid))
 
     def pending(self, limit: int, account_ids: tuple[str, ...]):
@@ -151,6 +168,40 @@ class Store:
             wait = max(2, retry_after or min(3600, 2 ** min(attempts, 11)))
             self.db.execute("UPDATE digests SET attempts=?,retry_at=? WHERE id=?", (attempts, time.time() + wait, digest_id))
 
+    def notification_outbox(self):
+        row = self.db.execute("SELECT * FROM notifications WHERE status='pending' ORDER BY message_id LIMIT 1").fetchone()
+        if row is None:
+            return None
+        result = dict(row)
+        result["parts"] = json.loads(result["parts"])
+        return result
+
+    def notification_part_sent(self, message_id: int):
+        with self.db:
+            row = self.db.execute("SELECT * FROM notifications WHERE message_id=? AND status='pending'", (message_id,)).fetchone()
+            if row is None:
+                raise ValueError("Unknown notification")
+            sent_parts = row["sent_parts"] + 1
+            if sent_parts > len(json.loads(row["parts"])):
+                raise ValueError("Too many notification parts")
+            status = "sent" if sent_parts == len(json.loads(row["parts"])) else "pending"
+            self.db.execute("UPDATE notifications SET sent_parts=?,status=?,attempts=0,retry_at=0 WHERE message_id=?", (sent_parts, status, message_id))
+            # A notice is independent of the morning digest: the source mail
+            # remains pending (or queued) until its digest is acknowledged.
+
+    def notification_failed(self, message_id: int, retry_after: int | None = None):
+        with self.db:
+            row = self.db.execute("SELECT attempts FROM notifications WHERE message_id=? AND status='pending'", (message_id,)).fetchone()
+            if row is None:
+                raise ValueError("Unknown notification")
+            attempts = row[0] + 1
+            wait = max(2, retry_after or min(3600, 2 ** min(attempts, 11)))
+            self.db.execute("UPDATE notifications SET attempts=?,retry_at=? WHERE message_id=?", (attempts, time.time() + wait, message_id))
+
+    def notification_stats(self):
+        counts = {row[0]: row[1] for row in self.db.execute("SELECT status,COUNT(*) FROM notifications GROUP BY status")}
+        return {status: counts.get(status, 0) for status in ("pending", "sent")}
+
     def stats(self):
         counts = {row[0]: row[1] for row in self.db.execute("SELECT status,COUNT(*) FROM messages GROUP BY status")}
         return {status: counts.get(status, 0) for status in ("pending", "queued", "sent")}
@@ -158,9 +209,11 @@ class Store:
     def prune(self, days: int):
         cutoff = time.time() - days * 86400
         with self.db:
-            self.db.execute("DELETE FROM messages WHERE status='sent' AND created_at<?", (cutoff,))
+            self.db.execute("DELETE FROM notifications WHERE status='sent' AND created_at<?", (cutoff,))
+            self.db.execute("DELETE FROM messages WHERE status='sent' AND created_at<? AND NOT EXISTS (SELECT 1 FROM notifications WHERE notifications.message_id=messages.id)", (cutoff,))
             self.db.execute("DELETE FROM digests WHERE status='sent' AND created_at<?", (cutoff,))
             # Keep identities while any unsent mail remains: recovery must never
             # lose a pending item just because its fingerprint was aged out.
-            if not self.db.execute("SELECT 1 FROM messages WHERE status!='sent'").fetchone():
+            if (not self.db.execute("SELECT 1 FROM messages WHERE status!='sent'").fetchone()
+                    and not self.db.execute("SELECT 1 FROM notifications WHERE status='pending'").fetchone()):
                 self.db.execute("DELETE FROM mail_identities WHERE created_at<?", (cutoff,))
