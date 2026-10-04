@@ -68,6 +68,8 @@ chmod 600 .env config.toml
 
 По умолчанию `summary.mode = "extractive"`: **короткие выдержки, без AI**. Этот режим позволяет проверить почту и Telegram без ключа модели.
 
+Для работы только с уведомлениями поставьте `summary.mode = "disabled"` и `notify_new_mail = true`. Утренняя отправка и `/summary` отключаются; уже ожидающие сводки отменяются, письма и очередь уведомлений сохраняются. Клиент модели не создаётся и ключ не требуется. После подключения модели можно вернуть `openai` или `ollama`, сохранив расписание на нужное время. Ранее накопленные письма при этом доступны для сводки, пока не удалены из состояния.
+
 Для содержательной AI-сводки выберите один из вариантов:
 
 - `mode = "openai"`: укажите `SUMMARY_API_KEY`, `SUMMARY_MODEL` с доступной вам API-моделью; endpoint по умолчанию `https://api.openai.com/v1`. Тексты писем отправляются API-провайдеру. Используется Responses API с `store=false`, без инструментов; этот флаг отключает сохранение Responses state и сам по себе не означает отсутствие любых журналов у провайдера. [Официальная OpenAI documentation](https://developers.openai.com/api/docs/guides/migrate-to-responses), [data controls](https://developers.openai.com/api/docs/guides/your-data).

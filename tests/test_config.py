@@ -58,6 +58,13 @@ class ConfigTests(unittest.TestCase):
                 with self.assertRaisesRegex(ConfigError, 'excluded_sender_domains'):
                     load_config(self.config, secrets=False)
 
+    def test_disabled_summary_does_not_require_model_credentials(self):
+        self.config.write_text(BASE.read_text().replace('mode = "extractive"', 'mode = "disabled"'))
+        env = {"MAIL_1_PASSWORD": "a", "MAIL_2_PASSWORD": "b",
+               "TELEGRAM_BOT_TOKEN": "123:test", "TELEGRAM_CHAT_ID": "12345"}
+        with patch.dict(os.environ, env, clear=True):
+            self.assertEqual(load_config(self.config).summary.mode, 'disabled')
+
     def test_zero_accounts_are_rejected(self):
         self.config.write_text(BASE.read_text().split('[[accounts]]')[0], encoding="utf-8")
         with self.assertRaisesRegex(ConfigError, "один или два"):

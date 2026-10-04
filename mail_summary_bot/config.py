@@ -163,8 +163,8 @@ def load_config(path: str | Path, *, secrets: bool = True, mail_only: bool = Fal
             raise ConfigError(f"{name} должен быть положительным целым")
     if type(telegram.poll_timeout_seconds) is not int or not 0 <= telegram.poll_timeout_seconds <= 50:
         raise ConfigError("Telegram poll timeout: 0–50 секунд")
-    if summary.mode not in {"extractive", "openai", "ollama"}:
-        raise ConfigError("summary.mode: extractive, openai или ollama")
+    if summary.mode not in {"disabled", "extractive", "openai", "ollama"}:
+        raise ConfigError("summary.mode: disabled, extractive, openai или ollama")
     if type(summary.max_input_chars) is not int or summary.max_input_chars < 1000:
         raise ConfigError("max_input_chars должен быть не меньше 1000")
     if type(summary.timeout_seconds) is not int or summary.timeout_seconds <= 0:
@@ -177,7 +177,7 @@ def load_config(path: str | Path, *, secrets: bool = True, mail_only: bool = Fal
         required = [a.password_env for a in accounts]
         if not mail_only:
             required.extend([telegram.token_env, telegram.chat_id_env])
-            if summary.mode != "extractive":
+            if summary.mode in {"openai", "ollama"}:
                 required.append(summary.model_env)
             if summary.mode == "openai":
                 required.append(summary.api_key_env)

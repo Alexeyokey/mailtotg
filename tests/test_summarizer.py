@@ -24,6 +24,16 @@ def completed(text="[письмо №1; аккаунт account-1] Встреча
 
 
 class SummarizerTests(unittest.TestCase):
+    def test_disabled_summary_cannot_generate_excerpts_or_call_provider(self):
+        with patch.dict(os.environ, {}, clear=True), patch('mail_summary_bot.summarizer.httpx.Client') as client:
+            summarizer = Summarizer(SummaryConfig(mode='disabled'))
+            try:
+                with self.assertRaisesRegex(SummaryError, 'отключены'):
+                    summarizer.summarize([mail()])
+                client.assert_not_called()
+            finally:
+                summarizer.close()
+
     def client(self, handler, *, mode="openai", max_input_chars=60000, env=None):
         http_client = httpx.Client(transport=httpx.MockTransport(handler), trust_env=False)
         with patch.dict(os.environ, {**ENV, **(env or {})}, clear=True):

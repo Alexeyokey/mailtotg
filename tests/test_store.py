@@ -2,7 +2,10 @@
 
 from dataclasses import replace
 from pathlib import Path
+import json
+import sqlite3
 import tempfile
+import time
 import unittest
 from unittest.mock import patch
 
@@ -111,6 +114,60 @@ class StoreTests(unittest.TestCase):
         self.reopen()
         self.assertIsNone(self.store.outbox())
         self.assertEqual(self.store.stats(), {"pending": 1, "queued": 0, "sent": 0})
+
+    def test_cancelling_partly_sent_digest_requeues_mail_and_keeps_notifications(self):
+        self.store.save_poll("first", "binding", PollResult(41, 4, [mail(uid=i) for i in range(1, 5)]),
+                             notification_parts=lambda message: ["Уведомление"])
+        ids = [mid for mid, _ in self.store.pending(10, ("first",))]
+        complete_id = self.store.queue_digest([ids[0]], ["Подтверждённая сводка"])
+        self.store.part_sent(complete_id)
+        self.store.exclude_pending(lambda message: message.uid == 2, ("first",))
+        digest_id = self.store.queue_digest(ids[2:], ["Отправленная часть", "Ожидающая часть"])
+        self.store.part_sent(digest_id)
+        self.store.delivery_failed(digest_id, retry_after=60)
+        notifications_before = [tuple(row) for row in self.store.db.execute("SELECT * FROM notifications ORDER BY message_id")]
+
+        self.assertEqual(self.store.cancel_pending_digests(), 1)
+        self.reopen()
+        self.assertIsNone(self.store.outbox())
+        self.assertEqual(self.store.stats(), {"pending": 2, "queued": 0, "sent": 1})
+        self.assertEqual(self.store.excluded_count(), 1)
+        self.assertEqual([message.uid for _, message in self.store.pending(10, ("first",))], [3, 4])
+        self.assertEqual([tuple(row) for row in self.store.db.execute("SELECT * FROM notifications ORDER BY message_id")], notifications_before)
+        self.assertEqual(tuple(self.store.db.execute("SELECT status,sent_parts,attempts,retry_at FROM digests WHERE id=?", (digest_id,)).fetchone()), ("cancelled", 1, 1, 0))
+        self.assertEqual(self.store.db.execute("SELECT status FROM digests WHERE id=?", (complete_id,)).fetchone()[0], "sent")
+        self.assertEqual(self.store.cancel_pending_digests(), 0)
+
+    def test_cancelling_all_legacy_pending_digests_is_atomic_on_database_failure(self):
+        self.store.save_poll("first", "binding", PollResult(41, 2, [mail(uid=1), mail(uid=2)]))
+        ids = [mid for mid, _ in self.store.pending(10, ("first",))]
+        first_id = self.store.queue_digest([ids[0]], ["Первая сводка"])
+        # Recovery also handles legacy state with more than one pending digest,
+        # although normal queue_digest() allows only one at a time.
+        with self.store.db:
+            second_id = self.store.db.execute("INSERT INTO digests(parts,message_ids,created_at) VALUES (?,?,?)",
+                                               (json.dumps(["Вторая сводка"]), json.dumps([ids[1]]), time.time())).lastrowid
+            self.store.db.execute("UPDATE messages SET status='queued' WHERE id=?", (ids[1],))
+            self.store.db.execute(f"""CREATE TRIGGER stop_second_requeue BEFORE UPDATE OF status ON messages
+                                     WHEN OLD.id={ids[1]} AND NEW.status='pending'
+                                     BEGIN SELECT RAISE(ABORT, 'Simulated write failure'); END""")
+        with self.assertRaises(sqlite3.IntegrityError):
+            self.store.cancel_pending_digests()
+        self.reopen()
+        self.assertEqual(self.store.stats(), {"pending": 0, "queued": 2, "sent": 0})
+        self.assertEqual([row[0] for row in self.store.db.execute("SELECT status FROM digests ORDER BY id")], ["pending", "pending"])
+        with self.store.db:
+            self.store.db.execute("DROP TRIGGER stop_second_requeue")
+        self.assertEqual(self.store.cancel_pending_digests(), 2)
+        self.reopen()
+        self.assertEqual(self.store.stats(), {"pending": 2, "queued": 0, "sent": 0})
+        self.assertEqual([tuple(row) for row in self.store.db.execute("SELECT id,status FROM digests ORDER BY id")],
+                         [(first_id, "cancelled"), (second_id, "cancelled")])
+
+    def test_cancelling_pending_digests_on_empty_store_is_noop(self):
+        self.assertEqual(self.store.cancel_pending_digests(), 0)
+        self.assertEqual(self.store.stats(), {"pending": 0, "queued": 0, "sent": 0})
+        self.assertIsNone(self.store.outbox())
 
     def test_failure_and_partial_delivery_retain_mail_after_reopen(self):
         original = mail(body="Не терять исходное письмо")

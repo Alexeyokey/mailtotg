@@ -27,6 +27,7 @@ proxy_env = "TELEGRAM_PROXY_URL"
 poll_timeout_seconds = 10
 
 [summary]
+# disabled: только уведомления, сводок нет;
 # extractive: короткие выдержки без модели; openai: AI через Responses API;
 # ollama: AI на собственном сервере через /api/chat.
 mode = "extractive"

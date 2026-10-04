@@ -8,7 +8,7 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
-from mail_summary_bot.config import AccountConfig, Config, ServiceConfig
+from mail_summary_bot.config import AccountConfig, Config, ServiceConfig, SummaryConfig
 from mail_summary_bot.models import MailMessage, PollResult
 from mail_summary_bot.service import Service, account_binding, next_daily
 from mail_summary_bot.store import Store
@@ -121,6 +121,10 @@ class ServiceTests(unittest.TestCase):
 
     def exclude_ozon_senders(self):
         self.config = replace(self.config, service=replace(self.config.service, excluded_sender_domains=("ozon.ru", "ozon.com")))
+        self.service.config = self.config
+
+    def disable_summaries(self):
+        self.config = replace(self.config, summary=SummaryConfig(mode="disabled"))
         self.service.config = self.config
 
     def reopen_service(self):
@@ -378,6 +382,117 @@ class ServiceTests(unittest.TestCase):
         self.assertEqual(self.summarizer.calls, [[other_mail]])
         self.assertEqual(self.store.notification_stats()["pending"], 1)
 
+    def test_disabled_summary_mode_does_not_construct_summarizer_and_closes_safely(self):
+        self.disable_summaries()
+        self.service.close()
+        self.store = Store(self.path)
+        self.telegram = FakeTelegram()
+        with patch("mail_summary_bot.service.Summarizer", side_effect=AssertionError("Summary client must not be constructed")) as constructor:
+            self.service = Service(self.config, store=self.store, readers=self.readers, telegram=self.telegram)
+            constructor.assert_not_called()
+        self.assertFalse(self.service.summaries_enabled)
+        self.assertIsNone(self.service.summarizer)
+        self.service.close()
+        self.store = Store(self.path)
+        self.service = self.make_service()
+
+    def test_disabled_summaries_keep_immediate_notices_and_mail_for_future_ai(self):
+        self.enable_notifications()
+        self.disable_summaries()
+        self.reopen_service()
+        discovered = mail(uid=7)
+        self.readers[0].result = PollResult(41, 7, [discovered])
+        with patch("mail_summary_bot.service.time.time", return_value=1000), patch("mail_summary_bot.service.time.monotonic", return_value=100):
+            self.service.tick(poll_commands=False)
+        self.assertEqual(len(self.telegram.sent), 1)
+        self.assertIn(discovered.subject, self.telegram.sent[0])
+        self.assertNotIn("войдёт в сводку", self.telegram.sent[0])
+        self.assertEqual(self.summarizer.calls, [])
+        self.assertIsNone(self.store.outbox())
+        self.assertIsNone(self.store.notification_outbox())
+        self.assertEqual([message for _, message in self.store.pending(10, ("first",))], [discovered])
+        self.assertIn("отключ", self.service.status_text().casefold())
+
+    def test_disabled_summary_command_replies_without_generating_digest(self):
+        self.save_mail(mail())
+        self.disable_summaries()
+        self.reopen_service()
+        self.telegram.updates = [update(10, "/summary")]
+        self.service.commands()
+        self.assertEqual(len(self.telegram.replies), 1)
+        self.assertIn("отключ", self.telegram.replies[0].casefold())
+        self.assertNotIn(mail().body, self.telegram.replies[0])
+        self.assertEqual(self.store.get("telegram_offset"), "11")
+        self.assertEqual(self.store.get("digest_requested", "0"), "0")
+        self.assertEqual(self.summarizer.calls, [])
+        self.assertIsNone(self.store.outbox())
+        self.assertEqual(self.store.stats()["pending"], 1)
+
+    def test_disabled_summary_mode_ignores_due_schedule_and_stale_request(self):
+        self.save_mail(mail())
+        self.config = replace(self.config, service=replace(self.config.service, schedule="daily", digest_time="06:00"))
+        self.disable_summaries()
+        self.reopen_service()
+        due = datetime(2026, 10, 4, 3, 0, tzinfo=timezone.utc).timestamp()
+        self.store.set_many({"next_due": due, "digest_requested": "1"})
+        self.assertFalse(self.service.request_digest())
+        self.assertEqual(self.store.get("digest_requested"), "0")
+        with patch("mail_summary_bot.service.time.time", return_value=due + 60), patch("mail_summary_bot.service.time.monotonic", return_value=100):
+            self.service.tick(poll_commands=False)
+        self.assertFalse(self.service.build_digest(due + 60))
+        self.assertFalse(self.service.deliver(due + 60))
+        self.assertEqual(self.summarizer.calls, [])
+        self.assertEqual(self.telegram.sent, [])
+        self.assertIsNone(self.store.outbox())
+        self.assertEqual(self.store.get("digest_requested", "0"), "0")
+        self.assertEqual(self.store.stats()["pending"], 1)
+
+    def test_disabled_startup_cancels_queued_digest_and_preserves_source_and_notices(self):
+        self.enable_notifications()
+        first, second = mail(uid=1), mail(uid=2)
+        self.readers[0].result = PollResult(41, 2, [first, second])
+        self.service.poll_mail()
+        self.service.request_digest()
+        self.assertTrue(self.service.build_digest(1000))
+        self.assertEqual(self.store.stats()["queued"], 2)
+        self.assertEqual(self.store.notification_stats()["pending"], 2)
+        self.disable_summaries()
+        self.reopen_service()
+        self.assertIsNone(self.store.outbox())
+        self.assertEqual(self.store.stats(), {"pending": 2, "queued": 0, "sent": 0})
+        self.assertEqual([message for _, message in self.store.pending(10, ("first",))], [first, second])
+        self.assertEqual(self.store.notification_stats()["pending"], 2)
+        self.assertEqual(self.store.get("digest_requested", "0"), "0")
+        with patch("mail_summary_bot.service.time.time", return_value=1001):
+            self.assertFalse(self.service.deliver(1001))
+            self.assertTrue(self.service.deliver_notifications(1001))
+        self.assertEqual(len(self.telegram.sent), 1)
+        self.assertIn(first.subject, self.telegram.sent[0])
+        self.assertNotIn("Сводка почты", self.telegram.sent[0])
+        self.assertNotIn("Письмо также войдёт в сводку", self.telegram.sent[0])
+
+    def test_reenabling_ai_summary_uses_retained_mail_without_replaying_notice(self):
+        self.enable_notifications()
+        self.disable_summaries()
+        self.reopen_service()
+        discovered = mail(uid=7)
+        self.readers[0].result = PollResult(41, 7, [discovered])
+        with patch("mail_summary_bot.service.time.time", return_value=1000):
+            self.service.poll_mail()
+            self.assertTrue(self.service.deliver_notifications(1000))
+        self.config = replace(self.config, summary=SummaryConfig(mode="openai"))
+        self.reopen_service()
+        self.assertTrue(self.service.summaries_enabled)
+        self.assertFalse(self.service.deliver_notifications(1002))
+        self.service.request_digest()
+        self.assertTrue(self.service.build_digest(1002))
+        self.assertEqual(self.summarizer.calls, [[discovered]])
+        with patch("mail_summary_bot.service.time.time", return_value=1002):
+            self.assertTrue(self.service.deliver(1002))
+        self.assertEqual(len(self.telegram.sent), 1)
+        self.assertIn("Сводка почты", self.telegram.sent[0])
+        self.assertEqual(self.store.stats()["sent"], 1)
+
     def test_one_mailbox_failure_does_not_block_the_other(self):
         self.readers[0].error = RuntimeError("private-test-password")
         self.readers[1].result = PollResult(41, 3, [mail("second", uid=3)])
@@ -411,7 +526,7 @@ class ServiceTests(unittest.TestCase):
         ]
         self.service.commands()
         self.assertEqual(len(self.telegram.replies), 1)
-        self.assertIn("Почтовая сводка", self.telegram.replies[0])
+        self.assertIn("Почтовый бот", self.telegram.replies[0])
         self.assertEqual([len(r.calls) for r in self.readers], [0, 0])
         self.assertEqual(self.store.get("digest_requested", "0"), "0")
         self.assertEqual(self.store.get("telegram_offset"), "4")
@@ -556,7 +671,7 @@ class ServiceTests(unittest.TestCase):
         before = datetime(2026, 10, 3, 5, 59, tzinfo=timezone.utc).timestamp()
         due = datetime(2026, 10, 3, 6, 0, tzinfo=timezone.utc).timestamp()
         self.config = replace(self.config, service=replace(self.config.service, schedule="daily"))
-        signature = json.dumps(["daily", "09:00", "Europe/Moscow", self.config.service.digest_interval_minutes])
+        signature = json.dumps(["daily", "09:00", "Europe/Moscow", self.config.service.digest_interval_minutes, True])
         self.store.set("schedule_config", signature)
         with self.store.db:
             self.store.db.execute("DELETE FROM settings WHERE key='next_due'")

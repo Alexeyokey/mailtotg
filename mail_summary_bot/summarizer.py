@@ -104,14 +104,14 @@ def _display(value: str) -> str:
 
 class Summarizer:
     def __init__(self, settings: SummaryConfig, client: httpx.Client | None = None) -> None:
-        if settings.mode not in {"extractive", "openai", "ollama"}:
+        if settings.mode not in {"disabled", "extractive", "openai", "ollama"}:
             raise SummaryError("Неизвестный режим создания сводки.")
         self._settings = settings
         self._client = client
         self._model = ""
         self._headers: dict[str, str] = {}
         self._endpoint = ""
-        if settings.mode == "extractive":
+        if settings.mode in {"disabled", "extractive"}:
             return
         self._model = os.environ.get(settings.model_env, "").strip()
         if not self._model:
@@ -155,6 +155,8 @@ class Summarizer:
         return data
 
     def summarize(self, messages: list[MailMessage]) -> str:
+        if self._settings.mode == "disabled":
+            raise SummaryError("Сводки отключены.")
         if not messages:
             return "Новых писем нет."
         email_json, records = _email_input(messages, self._settings.max_input_chars)

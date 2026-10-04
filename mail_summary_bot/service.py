@@ -33,7 +33,7 @@ def account_binding(account) -> str:
     return hashlib.sha256(identity.encode()).hexdigest()
 
 
-def notification_text(message) -> str:
+def notification_text(message, *, summaries_enabled=True) -> str:
     """Bounded plain-text notice; mail content remains data and never executes."""
     def excerpt(value, limit):
         value = re.sub(r"\s+", " ", value).strip()
@@ -45,7 +45,8 @@ def notification_text(message) -> str:
         "Тема: " + (excerpt(message.subject, 512) or "(без темы)"),
         "Дата: " + (excerpt(message.date, 80) or "(не указана)"),
         "", excerpt(message.body, 450) or "(Текст письма отсутствует.)",
-        "", "Краткая выдержка; полный текст — в почте. Письмо также войдёт в сводку.",
+        "", "Краткая выдержка; полный текст — в почте."
+        + (" Письмо также войдёт в сводку." if summaries_enabled else ""),
     ])
 
 
@@ -55,7 +56,7 @@ class Service:
         self.store = store if store is not None else Store(config.service.database)
         self.readers = readers if readers is not None else [MailReader(a, config.service) for a in config.accounts]
         self.telegram = telegram if telegram is not None else TelegramClient(config.telegram)
-        self.summarizer = summarizer if summarizer is not None else Summarizer(config.summary)
+        self.summarizer = (summarizer if summarizer is not None else Summarizer(config.summary)) if self.summaries_enabled else None
         self.next_mail_poll = 0.0
         self.next_summary_attempt = 0.0
         self.next_send_at = 0.0
@@ -63,21 +64,31 @@ class Service:
             self.store.checkpoint(account.id, account_binding(account))
         if config.service.excluded_sender_domains:
             self.store.exclude_pending(self.excluded, tuple(a.id for a in config.accounts))
-        signature = json.dumps([config.service.schedule, config.service.digest_time, config.service.timezone, config.service.digest_interval_minutes])
+        if not self.summaries_enabled:
+            self.store.cancel_pending_digests()
+            self.store.set("digest_requested", "0")
+        signature = json.dumps([config.service.schedule, config.service.digest_time, config.service.timezone, config.service.digest_interval_minutes, self.summaries_enabled])
         if self.store.get("schedule_config") != signature or self.store.get("next_due") is None:
             self.advance_schedule(time.time(), signature=signature)
 
     def close(self):
         self.telegram.close()
-        self.summarizer.close()
+        if self.summarizer is not None:
+            self.summarizer.close()
         self.store.close()
+
+    @property
+    def summaries_enabled(self):
+        return self.config.summary.mode != "disabled"
 
     def excluded(self, message):
         return sender_is_excluded(message.sender, self.config.service.excluded_sender_domains)
 
     def advance_schedule(self, now: float, *, signature=None):
         settings = self.config.service
-        if settings.schedule == "daily":
+        if not self.summaries_enabled:
+            next_due = 0
+        elif settings.schedule == "daily":
             next_due = next_daily(now, settings.digest_time, settings.timezone)
         elif settings.schedule == "interval":
             next_due = now + settings.digest_interval_minutes * 60
@@ -100,7 +111,7 @@ class Service:
                 result = reader.poll(checkpoint)
                 self.store.save_poll(
                     account.id, binding, result,
-                    notification_parts=(lambda mail: split_message(notification_text(mail)))
+                    notification_parts=(lambda mail: split_message(notification_text(mail, summaries_enabled=self.summaries_enabled)))
                     if self.config.service.notify_new_mail else None,
                     exclude_mail=self.excluded,
                 )
@@ -116,10 +127,16 @@ class Service:
                 LOG.warning("Mailbox %s unavailable (%s)", account.id, type(error).__name__)
 
     def request_digest(self):
+        if not self.summaries_enabled:
+            self.store.set("digest_requested", "0")
+            return False
         self.store.set("digest_requested", "1")
         self.next_summary_attempt = 0
+        return True
 
     def build_digest(self, now: float):
+        if not self.summaries_enabled:
+            return False
         if self.store.get("digest_requested", "0") != "1" or self.store.outbox() or now < self.next_summary_attempt:
             return False
         rows = self.store.pending(self.config.service.max_digest_messages, tuple(a.id for a in self.config.accounts))
@@ -148,6 +165,8 @@ class Service:
             return False
 
     def deliver(self, now: float):
+        if not self.summaries_enabled:
+            return False
         digest = self.store.outbox()
         if digest is None or now < max(digest["retry_at"], self.next_send_at):
             return False
@@ -167,7 +186,11 @@ class Service:
         if notice is None or now < max(notice["retry_at"], self.next_send_at):
             return False
         try:
-            self.telegram.send_chunk(notice["parts"][notice["sent_parts"]])
+            text = notice["parts"][notice["sent_parts"]]
+            promise = " Письмо также войдёт в сводку."
+            if not self.summaries_enabled and text.endswith(promise):
+                text = text[:-len(promise)]
+            self.telegram.send_chunk(text)
             self.store.notification_part_sent(notice["message_id"])
             self.next_send_at = time.time() + 1.1
             LOG.info("Telegram mail notification %s: delivered part %s/%s",
@@ -180,7 +203,8 @@ class Service:
 
     def status_text(self):
         stats = self.store.stats()
-        lines = ["Почтовая сводка", f"Ожидают сводки: {stats['pending']}", f"Ожидают доставки: {stats['queued']}", f"Режим: {self.config.summary.mode}"]
+        lines = ["Почтовый бот", f"Сводка: {self.config.summary.mode if self.summaries_enabled else 'отключена'}",
+                 f"Сохранено для сводки: {stats['pending']}", f"Ожидают доставки сводки: {stats['queued']}"]
         lines.append("Уведомления о новых письмах: " + ("включены" if self.config.service.notify_new_mail else "выключены"))
         lines.append(f"Ожидают уведомления: {self.store.notification_stats()['pending']}")
         if self.config.service.excluded_sender_domains:
@@ -217,17 +241,21 @@ class Service:
                 command = text.split(maxsplit=1)[0].split("@", 1)[0] if text else ""
                 answer = None
                 if command == "/summary":
-                    self.poll_mail()
-                    rows = self.store.pending(1, tuple(a.id for a in self.config.accounts))
-                    if rows or self.store.outbox():
-                        self.request_digest()
-                        answer = "Готовлю сводку новых писем. При недоступности сети доставка будет повторена."
+                    if not self.summaries_enabled:
+                        answer = "Сводка отключена. Уведомления о новых письмах работают; для ИИ-сводки нужно подключить модель."
                     else:
-                        answer = "Новых писем для сводки нет.\n" + self.status_text()
+                        self.poll_mail()
+                        rows = self.store.pending(1, tuple(a.id for a in self.config.accounts))
+                        if rows or self.store.outbox():
+                            self.request_digest()
+                            answer = "Готовлю сводку новых писем. При недоступности сети доставка будет повторена."
+                        else:
+                            answer = "Новых писем для сводки нет.\n" + self.status_text()
                 elif command == "/status":
                     answer = self.status_text()
                 elif command in {"/start", "/help"}:
-                    answer = f"Читаю настроенные ящики: {len(self.config.accounts)}.\n/summary — сводка новых писем\n/status — состояние подключений\nПисьма не помечаются прочитанными."
+                    summary_label = "сводка новых писем" if self.summaries_enabled else "сводка сейчас отключена"
+                    answer = f"Читаю настроенные ящики: {len(self.config.accounts)}.\n/summary — {summary_label}\n/status — состояние подключений\nПисьма не помечаются прочитанными."
                 if answer:
                     try:
                         self.telegram.send_text(answer)
@@ -243,7 +271,7 @@ class Service:
             self.poll_mail()
             self.next_mail_poll = time.monotonic() + self.config.service.poll_seconds
         due = float(self.store.get("next_due", 0))
-        if self.config.service.schedule != "manual" and due and now >= due:
+        if self.summaries_enabled and self.config.service.schedule != "manual" and due and now >= due:
             self.request_digest()
             self.advance_schedule(now)
         self.deliver_notifications(time.time())

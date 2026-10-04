@@ -173,6 +173,20 @@ class Store:
         rows = self.db.execute(f"SELECT id,payload FROM messages WHERE status='pending' AND account_id IN ({marks}) ORDER BY id LIMIT ?", (*account_ids, limit)).fetchall()
         return [(row["id"], MailMessage(**json.loads(row["payload"]))) for row in rows]
 
+    def cancel_pending_digests(self) -> int:
+        """Cancel digest delivery and requeue source mail as one transaction.
+
+        Already acknowledged chunks remain recorded. Notifications and mail
+        that is already sent or excluded have independent state and are kept.
+        """
+        with self.db:
+            rows = self.db.execute("SELECT id,message_ids FROM digests WHERE status='pending' ORDER BY id").fetchall()
+            for row in rows:
+                self.db.execute("UPDATE digests SET status='cancelled',retry_at=0 WHERE id=?", (row["id"],))
+                for message_id in json.loads(row["message_ids"]):
+                    self.db.execute("UPDATE messages SET status='pending' WHERE id=? AND status='queued'", (message_id,))
+        return len(rows)
+
     def queue_digest(self, message_ids: list[int], parts: list[str]):
         if not message_ids or not parts:
             raise ValueError("Empty digest")

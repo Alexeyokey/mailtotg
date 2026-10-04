@@ -78,8 +78,9 @@ def main():
                     if not service.deliver_notifications(time.time()):
                         print("Уведомление сохранено для повторной доставки.")
                         return 2
-                service.request_digest()
-                while True:
+                if service.summaries_enabled:
+                    service.request_digest()
+                while service.summaries_enabled:
                     built = service.build_digest(time.time())
                     if not built and not service.store.outbox():
                         if service.store.stats()["pending"]:

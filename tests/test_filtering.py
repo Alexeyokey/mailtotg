@@ -22,6 +22,14 @@ class SenderFilteringTests(unittest.TestCase):
     def test_empty_rules_allow_every_sender(self):
         self.assertFalse(sender_is_excluded('order@ozon.ru', ()))
 
+    def test_yoomoney_and_whoosh_actual_domains_are_blocked(self):
+        rules = ('ozon.ru', 'ozon.com', 'yoomoney.ru', 'whoosh.bike')
+        for sender in ('ЮMoney <info@yoomoney.ru>', 'Whoosh <support@d.whoosh.bike>'):
+            with self.subTest(sender=sender):
+                self.assertTrue(sender_is_excluded(sender, rules))
+        self.assertFalse(sender_is_excluded('Whoosh <notice@whoosh.bike.example.org>', rules))
+        self.assertFalse(sender_is_excluded('ЮMoney <teacher@example.org>', rules))
+
     def test_domain_normalization_and_idna(self):
         self.assertEqual(normalize_domain(' OZON.RU. '), 'ozon.ru')
         self.assertEqual(normalize_domain('пример.рф'), 'xn--e1afmkfd.xn--p1ai')
