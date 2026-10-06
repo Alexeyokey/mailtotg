@@ -8,7 +8,7 @@ import time
 import math
 import re
 
-from .config import Config
+from .config import Config, expand_accounts
 from .mail import MailReader
 from .store import Store
 from .summarizer import Summarizer
@@ -53,17 +53,22 @@ def notification_text(message, *, summaries_enabled=True) -> str:
 class Service:
     def __init__(self, config: Config, *, store=None, readers=None, telegram=None, summarizer=None):
         self.config = config
+        self.accounts = expand_accounts(config.accounts)
+        self.account_ids = tuple(account.id for account in self.accounts)
+        self.account_parents = {account.id: account.id.split("/", 1)[0] for account in self.accounts}
+        self.readers = list(readers) if readers is not None else [MailReader(a, config.service) for a in self.accounts]
+        if len(self.readers) != len(self.accounts):
+            raise ValueError("Each mailbox requires one reader")
         self.store = store if store is not None else Store(config.service.database)
-        self.readers = readers if readers is not None else [MailReader(a, config.service) for a in config.accounts]
         self.telegram = telegram if telegram is not None else TelegramClient(config.telegram)
         self.summarizer = (summarizer if summarizer is not None else Summarizer(config.summary)) if self.summaries_enabled else None
         self.next_mail_poll = 0.0
         self.next_summary_attempt = 0.0
         self.next_send_at = 0.0
-        for account in config.accounts:
+        for account in self.accounts:
             self.store.checkpoint(account.id, account_binding(account))
         if config.service.excluded_sender_domains:
-            self.store.exclude_pending(self.excluded, tuple(a.id for a in config.accounts))
+            self.store.exclude_pending(self.excluded, self.account_ids)
         if not self.summaries_enabled:
             self.store.cancel_pending_digests()
             self.store.set("digest_requested", "0")
@@ -84,6 +89,18 @@ class Service:
     def excluded(self, message):
         return sender_is_excluded(message.sender, self.config.service.excluded_sender_domains)
 
+    def display_mail(self, message):
+        return replace(message, account_id=self.account_parents.get(message.account_id, message.account_id))
+
+    @staticmethod
+    def mailbox_label(account):
+        if account.host.casefold() == "imap.mail.ru":
+            labels = {"INBOX": "Входящие", "INBOX/Newsletters": "Рассылки",
+                      "INBOX/Social": "Социальные сети", "INBOX/News": "Новости",
+                      "INBOX/Receipts": "Чеки"}
+            return labels.get(account.mailbox, account.mailbox)
+        return account.mailbox
+
     def advance_schedule(self, now: float, *, signature=None):
         settings = self.config.service
         if not self.summaries_enabled:
@@ -100,31 +117,49 @@ class Service:
         self.store.set_many(updates)
 
     def poll_mail(self):
-        for account, reader in zip(self.config.accounts, self.readers):
-            binding = account_binding(account)
-            checkpoint = self.store.checkpoint(account.id, binding)
+        if len(self.readers) != len(self.accounts):
+            raise ValueError("Each mailbox requires one reader")
+        parent_health = {account.id: True for account in self.config.accounts}
+        for account, reader in zip(self.accounts, self.readers):
+            parent_id = self.account_parents[account.id]
+            original_settings = None
+            adjusted = False
             try:
+                binding = account_binding(account)
+                checkpoint = self.store.checkpoint(account.id, binding)
                 previous_poll = self.store.get(f"last_poll:{account.id}")
                 if previous_poll and hasattr(reader, "settings"):
+                    original_settings = reader.settings
                     days = math.ceil(max(0, time.time() - float(previous_poll)) / 86400) + 1
                     reader.settings = replace(self.config.service, lookback_days=max(self.config.service.lookback_days, days))
+                    adjusted = True
                 result = reader.poll(checkpoint)
                 self.store.save_poll(
                     account.id, binding, result,
-                    notification_parts=(lambda mail: split_message(notification_text(mail, summaries_enabled=self.summaries_enabled)))
+                    notification_parts=(lambda mail: split_message(notification_text(self.display_mail(mail), summaries_enabled=self.summaries_enabled)))
                     if self.config.service.notify_new_mail else None,
                     exclude_mail=self.excluded,
+                    identity_account_id=parent_id,
                 )
                 if result.epoch_changed:
                     self.store.set(f"epoch_notice:{account.id}", "1")
+                    self.store.set(f"epoch_notice:{parent_id}", "1")
                     LOG.warning("Mailbox %s: identity epoch changed; recovering recent mail", account.id)
                 self.store.set(f"health:{account.id}", "ok")
+                self.store.set(f"folder_health:{account.id}", "ok")
                 self.store.set(f"last_poll:{account.id}", int(time.time()))
                 if result.messages:
                     LOG.info("Mailbox %s: %d new messages", account.id, len(result.messages))
             except Exception as error:
-                self.store.set(f"health:{account.id}", "error")
+                parent_health[parent_id] = False
+                self.store.set_many({f"health:{account.id}": "error",
+                                     f"folder_health:{account.id}": "error"})
                 LOG.warning("Mailbox %s unavailable (%s)", account.id, type(error).__name__)
+            finally:
+                if adjusted:
+                    reader.settings = original_settings
+        self.store.set_many({f"health:{parent_id}": "ok" if healthy else "error"
+                             for parent_id, healthy in parent_health.items()})
 
     def request_digest(self):
         if not self.summaries_enabled:
@@ -139,12 +174,12 @@ class Service:
             return False
         if self.store.get("digest_requested", "0") != "1" or self.store.outbox() or now < self.next_summary_attempt:
             return False
-        rows = self.store.pending(self.config.service.max_digest_messages, tuple(a.id for a in self.config.accounts))
+        rows = self.store.pending(self.config.service.max_digest_messages, self.account_ids)
         if not rows:
             self.store.set("digest_requested", "0")
             return False
         try:
-            result = self.summarizer.summarize([message for _, message in rows])
+            result = self.summarizer.summarize([self.display_mail(message) for _, message in rows])
             if not isinstance(result, str) or not result.strip():
                 raise ValueError("Empty summary")
             created = datetime.fromtimestamp(now, ZoneInfo(self.config.service.timezone)).strftime("%d.%m.%Y %H:%M")
@@ -156,8 +191,9 @@ class Service:
             if epochs:
                 header += "Восстановление после изменения идентификаторов почты: " + ", ".join(epochs) + ". Возможны повторы писем без стабильного Message-ID.\n"
             self.store.queue_digest([mid for mid, _ in rows], split_message(header + "\n" + result))
-            for account_id in epochs:
-                self.store.set(f"epoch_notice:{account_id}", "0")
+            for account_id in self.account_ids:
+                if self.store.get(f"epoch_notice:{account_id}") == "1":
+                    self.store.set(f"epoch_notice:{account_id}", "0")
             return True
         except Exception as error:
             self.next_summary_attempt = now + 60
@@ -212,9 +248,15 @@ class Service:
             lines.append(f"Исключено писем: {self.store.excluded_count()}")
         zone = ZoneInfo(self.config.service.timezone)
         for account in self.config.accounts:
-            stamp = self.store.get(f"last_poll:{account.id}")
+            folders = [stream for stream in self.accounts if self.account_parents[stream.id] == account.id]
+            stamps = [self.store.get(f"last_poll:{stream.id}") for stream in folders]
+            stamp = min(map(int, stamps)) if all(stamps) else None
             date = datetime.fromtimestamp(int(stamp), zone).strftime("%d.%m %H:%M") if stamp else "ещё не проверен"
             lines.append(f"{account.id}: {self.store.get(f'health:{account.id}', 'ожидание')}; {date}")
+            if len(folders) > 1:
+                for stream in folders:
+                    health = self.store.get(f"folder_health:{stream.id}", "ожидание")
+                    lines.append(f"  Папка {self.mailbox_label(stream)}: {health}")
             if self.store.get(f"epoch_notice:{account.id}") == "1":
                 lines.append(f"{account.id}: восстановлен недавний период после смены идентификаторов; возможны повторы")
         return "\n".join(lines)
@@ -245,7 +287,7 @@ class Service:
                         answer = "Сводка отключена. Уведомления о новых письмах работают; для ИИ-сводки нужно подключить модель."
                     else:
                         self.poll_mail()
-                        rows = self.store.pending(1, tuple(a.id for a in self.config.accounts))
+                        rows = self.store.pending(1, self.account_ids)
                         if rows or self.store.outbox():
                             self.request_digest()
                             answer = "Готовлю сводку новых писем. При недоступности сети доставка будет повторена."

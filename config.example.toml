@@ -45,6 +45,8 @@ port = 993
 username = "your-name@gmail.com"
 password_env = "MAIL_1_PASSWORD"
 mailbox = "INBOX"
+# Дополнительные входящие папки того же адреса. Имена должны существовать на IMAP-сервере.
+additional_mailboxes = []
 
 [[accounts]]
 id = "work"
@@ -53,3 +55,5 @@ port = 993
 username = "your-name@yandex.ru"
 password_env = "MAIL_2_PASSWORD"
 mailbox = "INBOX"
+# Для Mail.ru, например: ["INBOX/Newsletters", "INBOX/Social", "INBOX/News", "INBOX/Receipts"].
+additional_mailboxes = []

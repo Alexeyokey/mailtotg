@@ -19,6 +19,7 @@ class AccountConfig:
     port: int = 993
     mailbox: str = "INBOX"
     timeout_seconds: int = 30
+    additional_mailboxes: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -69,6 +70,18 @@ class Config:
 
 class ConfigError(ValueError):
     pass
+
+
+def expand_accounts(accounts: tuple[AccountConfig, ...]) -> tuple[AccountConfig, ...]:
+    """Give each folder a durable stream while preserving primary account IDs."""
+    expanded = []
+    for account in accounts:
+        expanded.append(account)
+        expanded.extend(
+            replace(account, id=f"{account.id}/{mailbox}", mailbox=mailbox, additional_mailboxes=())
+            for mailbox in account.additional_mailboxes
+        )
+    return tuple(expanded)
 
 
 def load_env(path: str | Path) -> None:
@@ -122,18 +135,32 @@ def load_config(path: str | Path, *, secrets: bool = True, mail_only: bool = Fal
     if not isinstance(entries, list) or not 1 <= len(entries) <= 2:
         raise ConfigError("Нужно настроить один или два [[accounts]]")
     accounts = tuple(_section(AccountConfig, item) for item in entries)
+    normalized_accounts = []
     for a in accounts:
         if not isinstance(a.id, str) or not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", a.id):
             raise ConfigError("id ящика: 1–64 латинские буквы, цифры, _ или -")
         if not all(isinstance(v, str) and v.strip() for v in (a.host, a.username, a.password_env, a.mailbox)):
             raise ConfigError(f"Заполните адрес и авторизацию ящика {a.id}")
+        if not isinstance(a.additional_mailboxes, (list, tuple)):
+            raise ConfigError(f"additional_mailboxes ящика {a.id} должен быть списком папок")
+        mailboxes = (a.mailbox, *a.additional_mailboxes)
+        if any(not isinstance(mailbox, str) or not mailbox.strip()
+               or re.search(r"[\x00-\x1f\x7f]", mailbox) for mailbox in mailboxes):
+            raise ConfigError(f"Некорректное имя IMAP-папки ящика {a.id}")
+        keys = ["INBOX" if mailbox.upper() == "INBOX" else mailbox for mailbox in mailboxes]
+        if len(set(keys)) != len(keys):
+            raise ConfigError(f"IMAP-папки ящика {a.id} не должны повторяться")
+        normalized_accounts.append(replace(a, additional_mailboxes=tuple(a.additional_mailboxes)))
         if type(a.port) is not int or not 1 <= a.port <= 65535:
             raise ConfigError(f"Некорректный IMAP port для {a.id}")
         if type(a.timeout_seconds) is not int or a.timeout_seconds <= 0:
             raise ConfigError(f"Некорректный IMAP timeout для {a.id}")
+    accounts = tuple(normalized_accounts)
     if len({a.id for a in accounts}) != len(accounts):
         raise ConfigError("У ящиков должны быть разные id")
-    if len({(a.host, a.username, a.mailbox) for a in accounts}) != len(accounts):
+    expanded = expand_accounts(accounts)
+    if len({(a.host, a.username, "INBOX" if a.mailbox.upper() == "INBOX" else a.mailbox)
+            for a in expanded}) != len(expanded):
         raise ConfigError("Подключения должны указывать на разные ящики")
     service = _section(ServiceConfig, data.get("service", {}))
     telegram = _section(TelegramConfig, data.get("telegram", {}))

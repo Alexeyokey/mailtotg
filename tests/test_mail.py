@@ -455,5 +455,41 @@ class IMAPPollingTests(unittest.TestCase):
                 MailReader(self.account, self.settings).poll(None)
 
 
+class MailboxSelectionTests(unittest.TestCase):
+    def test_configured_folder_is_encoded_quoted_and_opened_readonly(self):
+        cases = (
+            ("INBOX", "INBOX"),
+            ("inbox", "inbox"),
+            ("Newsletters", '"Newsletters"'),
+            ("My Receipts", '"My Receipts"'),
+            ('Team "Receipts"\\Archive', r'"Team \"Receipts\"\\Archive"'),
+            ("Рассылки", '"&BCAEMARBBEEESwQ7BDoEOA-"'),
+            ("台北", '"&U,BTFw-"'),
+            ("INBOX/台北 & Archive", '"INBOX/&U,BTFw- &- Archive"'),
+            ("&U,BTFw-", '"&U,BTFw-"'),
+            ("A&-B", '"A&-B"'),
+        )
+        for mailbox, expected in cases:
+            with self.subTest(mailbox=mailbox):
+                account = AccountConfig("personal", "imap.example.test", "user", "TEST_MAIL_PASSWORD", mailbox=mailbox)
+                fake = FakeIMAP()
+                with patch.dict(os.environ, {"TEST_MAIL_PASSWORD": "synthetic-password"}, clear=True), \
+                        patch("mail_summary_bot.mail.imaplib.IMAP4_SSL", return_value=fake):
+                    MailReader(account, ServiceConfig()).poll(None)
+                self.assertIn(("select", expected, True), fake.calls)
+                self.assertTrue(fake.logged_out)
+                expected.encode("ascii")
+
+    def test_invalid_folder_never_reaches_the_imap_server(self):
+        for mailbox in ("", " ", None, 7, "INBOX\rFETCH", "INBOX\nFETCH", "INBOX\0", "INBOX\t", "INBOX\x7f"):
+            with self.subTest(mailbox=repr(mailbox)):
+                account = AccountConfig("personal", "imap.example.test", "user", "TEST_MAIL_PASSWORD", mailbox=mailbox)
+                with patch.dict(os.environ, {"TEST_MAIL_PASSWORD": "synthetic-password"}, clear=True), \
+                        patch("mail_summary_bot.mail.imaplib.IMAP4_SSL") as factory:
+                    with self.assertRaises(MailReadError):
+                        MailReader(account, ServiceConfig()).poll(None)
+                factory.assert_not_called()
+
+
 if __name__ == "__main__":
     unittest.main()

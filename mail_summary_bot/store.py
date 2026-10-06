@@ -92,7 +92,11 @@ class Store:
 
     def save_poll(self, account_id: str, binding: str, result: PollResult, *,
                   notification_parts: Callable[[MailMessage], list[str]] | None = None,
-                  exclude_mail: Callable[[MailMessage], bool] | None = None):
+                  exclude_mail: Callable[[MailMessage], bool] | None = None,
+                  identity_account_id: str | None = None):
+        identity_scope = account_id if identity_account_id is None else identity_account_id
+        if not isinstance(identity_scope, str) or not identity_scope:
+            raise ValueError("Invalid mail identity account")
         with self.db:
             self.checkpoint(account_id, binding)
             if result.uidvalidity <= 0 or result.last_uid < 0:
@@ -100,13 +104,13 @@ class Store:
             for mail in result.messages:
                 if mail.account_id != account_id or mail.uidvalidity != result.uidvalidity or not 0 < mail.uid <= result.last_uid:
                     raise ValueError("Inconsistent mailbox result")
-                # A mailbox rebuild can give the same email a new UIDVALIDITY/UID.
+                # A mailbox rebuild or folder move can give mail new IMAP IDs.
                 # Nonempty Message-ID plus content/headers avoids replaying it;
                 # email without Message-ID remains deduplicated by IMAP identity.
                 if mail.message_id:
                     identity = json.dumps([mail.message_id, mail.sender, mail.subject, mail.date, mail.body], ensure_ascii=False)
                     fingerprint = hashlib.sha256(identity.encode()).hexdigest()
-                    known = self.db.execute("INSERT OR IGNORE INTO mail_identities VALUES (?,?,?)", (account_id, fingerprint, time.time()))
+                    known = self.db.execute("INSERT OR IGNORE INTO mail_identities VALUES (?,?,?)", (identity_scope, fingerprint, time.time()))
                     if not known.rowcount:
                         continue
                 inserted = self.db.execute("INSERT OR IGNORE INTO messages(account_id,uidvalidity,uid,payload,created_at) VALUES (?,?,?,?,?)", (account_id, mail.uidvalidity, mail.uid, json.dumps(asdict(mail), ensure_ascii=False), time.time()))

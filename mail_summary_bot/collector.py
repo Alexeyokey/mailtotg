@@ -7,7 +7,7 @@ import logging
 import math
 import time
 
-from .config import Config
+from .config import Config, expand_accounts
 from .mail import MailReader
 from .store import Store
 from .filtering import sender_is_excluded
@@ -27,16 +27,19 @@ class Collector:
         self.config = config
         if not 1 <= len(config.accounts) <= 2:
             raise ValueError("Collector requires one or two mailboxes")
-        self.readers = list(readers) if readers is not None else [MailReader(a, config.service) for a in config.accounts]
-        if len(self.readers) != len(config.accounts):
+        self.accounts = expand_accounts(config.accounts)
+        self.account_ids = tuple(account.id for account in self.accounts)
+        self.account_parents = {account.id: account.id.split("/", 1)[0] for account in self.accounts}
+        self.readers = list(readers) if readers is not None else [MailReader(a, config.service) for a in self.accounts]
+        if len(self.readers) != len(self.accounts):
             raise ValueError("Each mailbox requires one reader")
         self.store = store if store is not None else Store(config.service.database)
         self._closed = False
         try:
-            for account in config.accounts:
+            for account in self.accounts:
                 self.store.checkpoint(account.id, account_binding(account))
             if config.service.excluded_sender_domains:
-                self.store.exclude_pending(self.excluded, tuple(a.id for a in config.accounts))
+                self.store.exclude_pending(self.excluded, self.account_ids)
         except Exception:
             if store is None:
                 self.close()
@@ -48,8 +51,12 @@ class Collector:
     def poll(self) -> bool:
         if self._closed:
             raise RuntimeError("Collector is closed")
+        if len(self.readers) != len(self.accounts):
+            raise ValueError("Each mailbox requires one reader")
         all_ok = True
-        for account, reader in zip(self.config.accounts, self.readers):
+        parent_health = {account.id: True for account in self.config.accounts}
+        for account, reader in zip(self.accounts, self.readers):
+            parent_id = self.account_parents[account.id]
             adjusted = False
             original_settings = None
             try:
@@ -65,21 +72,26 @@ class Collector:
                     )
                     adjusted = True
                 result = reader.poll(checkpoint)
-                self.store.save_poll(account.id, binding, result, exclude_mail=self.excluded)
+                self.store.save_poll(account.id, binding, result, exclude_mail=self.excluded,
+                                     identity_account_id=parent_id)
                 updates = {
                     f"health:{account.id}": "ok",
+                    f"folder_health:{account.id}": "ok",
                     f"last_poll:{account.id}": int(time.time()),
                 }
                 if result.epoch_changed:
                     updates[f"epoch_notice:{account.id}"] = "1"
+                    updates[f"epoch_notice:{parent_id}"] = "1"
                     LOG.warning("Mailbox %s: identity epoch changed; recovering recent mail", account.id)
                 self.store.set_many(updates)
                 if result.messages:
                     LOG.info("Mailbox %s: processed %d messages", account.id, len(result.messages))
             except Exception as error:
                 all_ok = False
+                parent_health[parent_id] = False
                 try:
-                    self.store.set(f"health:{account.id}", "error")
+                    self.store.set_many({f"health:{account.id}": "error",
+                                         f"folder_health:{account.id}": "error"})
                 except Exception as state_error:
                     LOG.warning("Mailbox %s status persistence failed (%s)", account.id, type(state_error).__name__)
                 # Never log exception text: it may contain credentials or mail.
@@ -87,6 +99,12 @@ class Collector:
             finally:
                 if adjusted:
                     reader.settings = original_settings
+        try:
+            self.store.set_many({f"health:{parent_id}": "ok" if healthy else "error"
+                                 for parent_id, healthy in parent_health.items()})
+        except Exception as error:
+            all_ok = False
+            LOG.warning("Mailbox status persistence failed (%s)", type(error).__name__)
         return all_ok
 
     def run(self):

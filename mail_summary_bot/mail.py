@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import imaplib
+import base64
 import os
 import re
 import ssl
@@ -24,6 +25,34 @@ BODY_TRUNCATION_NOTICE = "[Текст письма сокращён.]"
 
 class MailReadError(RuntimeError):
     """An IMAP failure with a safe message (never a server authentication reply)."""
+
+
+def _mailbox_argument(value: str) -> str:
+    if (not isinstance(value, str) or not value.strip()
+            or any(ord(char) < 32 or ord(char) == 127 for char in value)):
+        raise MailReadError("Invalid IMAP mailbox name.")
+    # Preserve ASCII wire names from LIST; encode human-readable Unicode names.
+    wire = value
+    if not value.isascii():
+        parts, encoded = [], []
+
+        def flush():
+            if encoded:
+                data = "".join(encoded).encode("utf-16-be")
+                parts.append("&" + base64.b64encode(data).decode("ascii").rstrip("=").replace("/", ",") + "-")
+                encoded.clear()
+
+        for char in value:
+            if 32 <= ord(char) <= 126:
+                flush()
+                parts.append("&-" if char == "&" else char)
+            else:
+                encoded.append(char)
+        flush()
+        wire = "".join(parts)
+    if wire.upper() == "INBOX":
+        return wire
+    return '"' + wire.replace("\\", "\\\\").replace('"', '\\"') + '"'
 
 
 def _decode_bytes(value: bytes, charset: str | None = None) -> str:
@@ -284,6 +313,7 @@ class MailReader:
     def poll(self, checkpoint: tuple[int, int] | None) -> PollResult:
         client = None
         try:
+            mailbox = _mailbox_argument(self.account.mailbox)
             password = os.environ[self.account.password_env]
             client = imaplib.IMAP4_SSL(
                 self.account.host, self.account.port,
@@ -292,7 +322,7 @@ class MailReader:
             status, _ = client.login(self.account.username, password)
             if status != "OK":
                 raise MailReadError("IMAP authentication failed.")
-            status, _ = client.select(self.account.mailbox, readonly=True)
+            status, _ = client.select(mailbox, readonly=True)
             if status != "OK":
                 raise MailReadError("IMAP mailbox could not be selected.")
             _, data = client.response("UIDVALIDITY")
