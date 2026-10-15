@@ -41,6 +41,8 @@ class FakeReader:
 
 class FakeTelegram:
     chat_id = OWNER
+    bot_id = 987654
+    next_message_id = 0
 
     def __init__(self, updates=None, outcomes=None):
         self.updates = updates or []
@@ -51,6 +53,7 @@ class FakeTelegram:
         self.replies = []
         self.timeouts = []
         self.events = []
+        self.markups = []
 
     def get_updates(self, offset, *, timeout=None):
         self.offsets.append(offset)
@@ -58,15 +61,18 @@ class FakeTelegram:
         self.events.append(("get_updates", offset, timeout))
         return self.updates
 
-    def send_chunk(self, text):
+    def send_chunk(self, text, *, reply_markup=None):
         self.attempts.append(text)
         self.events.append(("send_chunk", text))
         outcome = self.outcomes.pop(0) if self.outcomes else None
         if outcome:
             raise outcome
         self.sent.append(text)
+        self.markups.append(reply_markup)
+        type(self).next_message_id += 1
+        return type(self).next_message_id
 
-    def send_text(self, text):
+    def send_text(self, text, *, reply_markup=None):
         self.replies.append(text)
 
     def close(self):
@@ -122,6 +128,8 @@ class ServiceTests(unittest.TestCase):
     def exclude_ozon_senders(self):
         self.config = replace(self.config, service=replace(self.config.service, excluded_sender_domains=("ozon.ru", "ozon.com")))
         self.service.config = self.config
+        # Simulate configuration reload into durable rules.
+        self.store.seed_blacklist(self.config.service.excluded_sender_domains)
 
     def disable_summaries(self):
         self.config = replace(self.config, summary=SummaryConfig(mode="disabled"))

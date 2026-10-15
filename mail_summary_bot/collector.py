@@ -10,7 +10,6 @@ import time
 from .config import Config, expand_accounts
 from .mail import MailReader
 from .store import Store
-from .filtering import sender_is_excluded
 
 
 LOG = logging.getLogger(__name__)
@@ -38,15 +37,15 @@ class Collector:
         try:
             for account in self.accounts:
                 self.store.checkpoint(account.id, account_binding(account))
-            if config.service.excluded_sender_domains:
-                self.store.exclude_pending(self.excluded, self.account_ids)
+            self.store.seed_blacklist(config.service.excluded_sender_domains)
+            self.store.exclude_pending(self.excluded, self.account_ids, include_sent=True)
         except Exception:
             if store is None:
                 self.close()
             raise
 
     def excluded(self, message):
-        return sender_is_excluded(message.sender, self.config.service.excluded_sender_domains)
+        return self.store.blacklist_matches(message.sender)
 
     def poll(self) -> bool:
         if self._closed:

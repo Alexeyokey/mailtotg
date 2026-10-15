@@ -12,8 +12,8 @@ from .config import Config, expand_accounts
 from .mail import MailReader
 from .store import Store
 from .summarizer import Summarizer
-from .telegram import TelegramClient, split_message
-from .filtering import sender_is_excluded
+from .telegram import TelegramClient, TelegramError, split_message
+from .mailbox_ui import MailboxUI, COMMANDS, notification_keyboard
 
 LOG = logging.getLogger(__name__)
 
@@ -65,10 +65,13 @@ class Service:
         self.next_mail_poll = 0.0
         self.next_summary_attempt = 0.0
         self.next_send_at = 0.0
+        self.menu_setup_pending = False
+        self.next_menu_attempt = 0.0
         for account in self.accounts:
             self.store.checkpoint(account.id, account_binding(account))
-        if config.service.excluded_sender_domains:
-            self.store.exclude_pending(self.excluded, self.account_ids)
+        self.store.seed_blacklist(config.service.excluded_sender_domains)
+        self.store.exclude_pending(self.excluded, self.account_ids, include_sent=True)
+        self.mailbox_ui = MailboxUI(self)
         if not self.summaries_enabled:
             self.store.cancel_pending_digests()
             self.store.set("digest_requested", "0")
@@ -87,7 +90,7 @@ class Service:
         return self.config.summary.mode != "disabled"
 
     def excluded(self, message):
-        return sender_is_excluded(message.sender, self.config.service.excluded_sender_domains)
+        return self.store.blacklist_matches(message.sender)
 
     def display_mail(self, message):
         return replace(message, account_id=self.account_parents.get(message.account_id, message.account_id))
@@ -226,8 +229,9 @@ class Service:
             promise = " Письмо также войдёт в сводку."
             if not self.summaries_enabled and text.endswith(promise):
                 text = text[:-len(promise)]
-            self.telegram.send_chunk(text)
-            self.store.notification_part_sent(notice["message_id"])
+            telegram_id = self.telegram.send_chunk(text, reply_markup=notification_keyboard(notice["message_id"]))
+            self.store.notification_part_sent(notice["message_id"], telegram_message_id=telegram_id,
+                                              chat_id=self.telegram.chat_id)
             self.next_send_at = time.time() + 1.1
             LOG.info("Telegram mail notification %s: delivered part %s/%s",
                      notice["message_id"], notice["sent_parts"] + 1, len(notice["parts"]))
@@ -243,9 +247,9 @@ class Service:
                  f"Сохранено для сводки: {stats['pending']}", f"Ожидают доставки сводки: {stats['queued']}"]
         lines.append("Уведомления о новых письмах: " + ("включены" if self.config.service.notify_new_mail else "выключены"))
         lines.append(f"Ожидают уведомления: {self.store.notification_stats()['pending']}")
-        if self.config.service.excluded_sender_domains:
-            lines.append("Исключённые отправители: " + ', '.join(self.config.service.excluded_sender_domains))
-            lines.append(f"Исключено писем: {self.store.excluded_count()}")
+        rule_count, _ = self.store.blacklist_page(0, 1)
+        lines.append(f"Правил в чёрном списке: {rule_count} · /blacklist")
+        lines.append(f"Заблокировано писем: {self.store.excluded_count()} · /blocked")
         zone = ZoneInfo(self.config.service.timezone)
         for account in self.config.accounts:
             folders = [stream for stream in self.accounts if self.account_parents[stream.id] == account.id]
@@ -262,6 +266,8 @@ class Service:
         return "\n".join(lines)
 
     def commands(self):
+        if time.time() < float(self.store.get("telegram_command_retry_at", 0)):
+            return
         offset = int(self.store.get("telegram_offset", 0))
         try:
             if self.store.notification_outbox():
@@ -270,44 +276,60 @@ class Service:
                 updates = self.telegram.get_updates(offset)
         except Exception as error:
             LOG.warning("Telegram polling unavailable (%s)", type(error).__name__)
+            self.defer_command(error)
             return
         for update in updates:
             update_id = update.get("update_id")
-            if not isinstance(update_id, int) or update_id < offset:
+            if type(update_id) is not int or update_id < offset:
                 continue
-            message = update.get("message", {})
-            chat = message.get("chat", {})
-            text = message.get("text", "")
-            if chat.get("type") == "private" and str(chat.get("id")) == str(self.telegram.chat_id) and isinstance(text, str):
-                text = text.strip()
-                command = text.split(maxsplit=1)[0].split("@", 1)[0] if text else ""
-                answer = None
-                if command == "/summary":
-                    if not self.summaries_enabled:
-                        answer = "Сводка отключена. Уведомления о новых письмах работают; для ИИ-сводки нужно подключить модель."
-                    else:
-                        self.poll_mail()
-                        rows = self.store.pending(1, self.account_ids)
-                        if rows or self.store.outbox():
-                            self.request_digest()
-                            answer = "Готовлю сводку новых писем. При недоступности сети доставка будет повторена."
-                        else:
-                            answer = "Новых писем для сводки нет.\n" + self.status_text()
-                elif command == "/status":
-                    answer = self.status_text()
-                elif command in {"/start", "/help"}:
-                    summary_label = "сводка новых писем" if self.summaries_enabled else "сводка сейчас отключена"
-                    answer = f"Читаю настроенные ящики: {len(self.config.accounts)}.\n/summary — {summary_label}\n/status — состояние подключений\nПисьма не помечаются прочитанными."
-                if answer:
-                    try:
-                        self.telegram.send_text(answer)
-                        self.next_send_at = time.time() + 1.1
-                    except Exception as error:
-                        LOG.warning("Telegram command reply unavailable (%s)", type(error).__name__)
+            try:
+                query = update.get("callback_query")
+                if query is not None:
+                    self.mailbox_ui.handle_callback(query)
+                else:
+                    message = update.get("message", {})
+                    if self.mailbox_ui.authorized(message):
+                        text = message.get("text", "")
+                        text = text.strip() if isinstance(text, str) else ""
+                        command = text.split(maxsplit=1)[0].split("@", 1)[0] if text else ""
+                        answer = None
+                        if self.mailbox_ui.handle_message(message):
+                            self.next_send_at = time.time() + 1.1
+                        elif command == "/summary":
+                            if not self.summaries_enabled:
+                                answer = "Сводка отключена. Уведомления о новых письмах работают; для ИИ-сводки нужно подключить модель."
+                            else:
+                                self.poll_mail()
+                                rows = self.store.pending(1, self.account_ids)
+                                if rows or self.store.outbox():
+                                    self.request_digest()
+                                    answer = "Готовлю сводку новых писем. При недоступности сети доставка будет повторена."
+                                else:
+                                    answer = "Новых писем для сводки нет.\n" + self.status_text()
+                        elif command == "/status":
+                            answer = self.status_text()
+                        if answer:
+                            self.telegram.send_text(answer)
+                            self.next_send_at = time.time() + 1.1
+            except Exception as error:
+                LOG.warning("Telegram command reply unavailable (%s)", type(error).__name__)
+                if isinstance(error, TelegramError) and (error.status_code is None
+                        or error.status_code == 429 or error.status_code >= 500):
+                    self.defer_command(error)
+                    # Keep this update for retry; following updates must wait.
+                    break
+            self.store.set("telegram_command_retry_at", "0")
             offset = update_id + 1
             self.store.set("telegram_offset", offset)
 
+    def defer_command(self, error):
+        retry_at = time.time() + max(2, getattr(error, "retry_after", None) or 5)
+        self.store.set("telegram_command_retry_at", retry_at)
+        self.next_send_at = max(self.next_send_at, retry_at)
+
     def tick(self, *, poll_commands=True):
+        if self.menu_setup_pending and time.monotonic() >= self.next_menu_attempt:
+            self.setup_menu()
         now = time.time()
         if time.monotonic() >= self.next_mail_poll:
             self.poll_mail()
@@ -324,7 +346,22 @@ class Service:
         self.deliver(now)
         self.store.prune(self.config.service.retention_days)
 
+    def setup_menu(self):
+        self.menu_setup_pending = True
+        try:
+            self.telegram.set_commands(COMMANDS)
+            if self.store.get("mailbox_ui_version") != "1":
+                self.mailbox_ui.welcome()
+                self.store.set("mailbox_ui_version", "1")
+            self.menu_setup_pending = False
+        except Exception as error:
+            self.next_menu_attempt = time.monotonic() + max(5, getattr(error, "retry_after", None) or 30)
+            if getattr(error, "retry_after", None):
+                self.defer_command(error)
+            LOG.warning("Telegram menu setup deferred (%s)", type(error).__name__)
+
     def run(self):
+        self.setup_menu()
         LOG.info("Started: %d mailboxes, schedule=%s, summary=%s", len(self.config.accounts), self.config.service.schedule, self.config.summary.mode)
         while True:
             self.tick()

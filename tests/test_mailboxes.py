@@ -40,12 +40,16 @@ class Reader:
 
 class Telegram:
     chat_id = 12345
+    bot_id = 987654
+    next_message_id = 0
 
     def __init__(self):
         self.sent = []
 
-    def send_chunk(self, text):
+    def send_chunk(self, text, *, reply_markup=None):
         self.sent.append(text)
+        type(self).next_message_id += 1
+        return type(self).next_message_id
 
     def close(self):
         pass
